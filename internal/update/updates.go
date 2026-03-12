@@ -96,6 +96,8 @@ func MarkUpdateAsChecked(update types.Update) error {
 	}
 	reader := strings.NewReader(".check")
 	_ = resolvedBucket.UploadFileIntoUpdate(update, ".check", reader)
+	go PreWarmManifestCache(update.Branch, update.RuntimeVersion, "ios")
+	go PreWarmManifestCache(update.Branch, update.RuntimeVersion, "android")
 	return nil
 }
 
@@ -615,8 +617,5 @@ func RepublishUpdate(previousUpdate *types.Update, platform, commitHash string) 
 	if err != nil {
 		return nil, err
 	}
-	cache := cache2.GetCache()
-	cacheKey := ComputeLastUpdateCacheKey(newUpdate.Branch, newUpdate.RuntimeVersion, platform)
-	cache.Delete(cacheKey)
 	return newUpdate, nil
 }
