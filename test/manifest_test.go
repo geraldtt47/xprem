@@ -5,7 +5,6 @@ import (
 	"expo-open-ota/internal/bucket"
 	cache2 "expo-open-ota/internal/cache"
 	"expo-open-ota/internal/handlers"
-	"expo-open-ota/internal/services"
 	"expo-open-ota/internal/types"
 	"expo-open-ota/internal/update"
 	"github.com/jarcoal/httpmock"
@@ -637,30 +636,33 @@ func TestEmptyRequestForAndroid(t *testing.T) {
 	assert.Equal(t, "{\"type\":\"noUpdateAvailable\"}", body)
 }
 
-func TestChannelMappingIsCached(t *testing.T) {
+
+func TestPreWarmManifestCache(t *testing.T) {
 	teardown := setup(t)
 	defer teardown()
 	mockWorkingExpoResponse("staging")
 
-	// First call — hits the Expo GraphQL API
-	mapping1, err := services.FetchExpoChannelMapping("staging")
-	assert.NoError(t, err)
-	assert.NotNil(t, mapping1)
-	assert.Equal(t, "branch-1", mapping1.BranchName)
-
-	// Verify cache was populated
 	cache := cache2.GetCache()
-	cachedValue := cache.Get("channelMapping:" + os.Getenv("APP_VERSION") + ":staging")
-	// The cache key includes the internal version, so just check via a second call
-	// after removing the mock — if it still works, it used cache.
-	httpmock.Reset()
 
-	// Second call — mock is gone, so this must use cache
-	mapping2, err := services.FetchExpoChannelMapping("staging")
+	// Verify caches are empty before prewarm
+	lastUpdateKey := update.ComputeLastUpdateCacheKey("branch-1", "1", "android")
+	assert.Equal(t, "", cache.Get(lastUpdateKey), "lastUpdate cache should be empty before prewarm")
+
+	// Run PreWarm synchronously (not as goroutine) for testing
+	update.PreWarmManifestCache("branch-1", "1", "android")
+
+	// Verify lastUpdate cache was populated
+	lastUpdateCached := cache.Get(lastUpdateKey)
+	assert.NotEqual(t, "", lastUpdateCached, "lastUpdate cache should be populated after prewarm")
+
+	// Verify metadata cache was populated
+	var cachedUpdate types.Update
+	err := json.Unmarshal([]byte(lastUpdateCached), &cachedUpdate)
 	assert.NoError(t, err)
-	assert.NotNil(t, mapping2)
-	assert.Equal(t, mapping1.BranchName, mapping2.BranchName)
-	assert.Equal(t, mapping1.Id, mapping2.Id)
+	metadataKey := update.ComputeMetadataCacheKey("branch-1", "1", cachedUpdate.UpdateId)
+	assert.NotEqual(t, "", cache.Get(metadataKey), "metadata cache should be populated after prewarm")
 
-	_ = cachedValue // used for debugging if needed
+	// Verify manifest cache was populated
+	manifestKey := update.ComputeUpdataManifestCacheKey("branch-1", "1", cachedUpdate.UpdateId, "android")
+	assert.NotEqual(t, "", cache.Get(manifestKey), "manifest cache should be populated after prewarm")
 }

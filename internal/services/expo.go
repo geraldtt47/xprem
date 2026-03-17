@@ -298,13 +298,13 @@ func FetchSelfExpoUsername() string {
 	return expoAccount.Username
 }
 
-func computeChannelMappingCacheKey(channelName string) string {
+func ComputeChannelMappingCacheKey(channelName string) string {
 	return fmt.Sprintf("channelMapping:%s:%s", version.Version, channelName)
 }
 
 func FetchExpoChannelMapping(channelName string) (*ExpoChannelMapping, error) {
 	cache := cache2.GetCache()
-	cacheKey := computeChannelMappingCacheKey(channelName)
+	cacheKey := ComputeChannelMappingCacheKey(channelName)
 	if cachedValue := cache.Get(cacheKey); cachedValue != "" {
 		var mapping ExpoChannelMapping
 		if err := json.Unmarshal([]byte(cachedValue), &mapping); err != nil {
