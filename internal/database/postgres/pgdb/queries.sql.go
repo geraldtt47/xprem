@@ -13,6 +13,41 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adoptionBreakdown = `-- name: AdoptionBreakdown :many
+SELECT current_update_id, COUNT(*) AS device_count
+FROM device_identity
+WHERE app_id = $1
+GROUP BY current_update_id
+ORDER BY device_count DESC, current_update_id ASC NULLS LAST
+`
+
+type AdoptionBreakdownRow struct {
+	CurrentUpdateID pgtype.UUID `json:"current_update_id"`
+	DeviceCount     int64       `json:"device_count"`
+}
+
+// The fleet's adoption breakdown, biggest cohorts first. NULL update = the
+// embedded bundle (or a device seen before this feature landed).
+func (q *Queries) AdoptionBreakdown(ctx context.Context, appID pgtype.UUID) ([]AdoptionBreakdownRow, error) {
+	rows, err := q.db.Query(ctx, adoptionBreakdown, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AdoptionBreakdownRow
+	for rows.Next() {
+		var i AdoptionBreakdownRow
+		if err := rows.Scan(&i.CurrentUpdateID, &i.DeviceCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const advanceAuditExportCursor = `-- name: AdvanceAuditExportCursor :execresult
 UPDATE audit_export_state
 SET last_exported_id = $2
@@ -28,6 +63,65 @@ type AdvanceAuditExportCursorParams struct {
 // and this batch must be abandoned (its file was an idempotent overwrite).
 func (q *Queries) AdvanceAuditExportCursor(ctx context.Context, arg AdvanceAuditExportCursorParams) (pgconn.CommandTag, error) {
 	return q.db.Exec(ctx, advanceAuditExportCursor, arg.LastExportedID, arg.LastExportedID_2)
+}
+
+const applyIdentityValueStats = `-- name: ApplyIdentityValueStats :exec
+INSERT INTO identity_value_stats (app_id, key, value, device_count)
+SELECT $1, t.key, t.value, t.delta
+FROM (
+    SELECT unnest($2::TEXT[])   AS key,
+           unnest($3::TEXT[]) AS value,
+           unnest($4::INT[])  AS delta
+) AS t
+WHERE t.delta > 0
+   OR EXISTS (
+       SELECT 1 FROM identity_value_stats s
+       WHERE s.app_id = $1 AND s.key = t.key AND s.value = t.value
+   )
+ORDER BY t.key, t.value
+ON CONFLICT (app_id, key, value) DO UPDATE SET
+    device_count = GREATEST(identity_value_stats.device_count + EXCLUDED.device_count, 0),
+    last_seen_at = CURRENT_TIMESTAMP
+`
+
+type ApplyIdentityValueStatsParams struct {
+	AppID  pgtype.UUID `json:"app_id"`
+	Keys   []string    `json:"keys"`
+	Values []string    `json:"values"`
+	Deltas []int32     `json:"deltas"`
+}
+
+// Per-value device counts, kept in step with the merges that produce them and
+// read back by autocomplete. The decrement floors at zero instead of deleting
+// the row, because the delete would have to run inside the same lock ordering
+// as the merge to be safe, and a row at zero is harmless: the third statement
+// sweeps it afterwards, outside the hot path. A count that drifted below zero
+// would be unrecoverable, one that lingers at zero is not.
+// ONE statement for the whole mutation, increments and decrements together,
+// and that is not a detail: the ordering these rows are locked in is what
+// keeps two devices sharing a stat row (same tenant, same plan) from
+// deadlocking, and it has to hold across ALL of a transaction's ops, not
+// within each direction. Splitting into "every increment, then every
+// decrement" would let A lock acme then globex while B locks globex then
+// acme, which is the deadlock the caller's sort exists to prevent.
+//
+// ORDER BY inside the SELECT is therefore load-bearing: rows are processed,
+// and their conflicts locked, in that order. The caller sorts too, so the two
+// agree.
+//
+// The WHERE keeps a decrement of a row that does not exist a no-op, which is
+// what the plain UPDATE did before: the EXISTS reads without locking, so it
+// adds nothing to the ordering. And the conflict arm floors at zero, because a
+// count that drifted below zero would be unrecoverable while one lingering at
+// zero is swept by the statement below.
+func (q *Queries) ApplyIdentityValueStats(ctx context.Context, arg ApplyIdentityValueStatsParams) error {
+	_, err := q.db.Exec(ctx, applyIdentityValueStats,
+		arg.AppID,
+		arg.Keys,
+		arg.Values,
+		arg.Deltas,
+	)
+	return err
 }
 
 const clearUpdateRollout = `-- name: ClearUpdateRollout :execrows
@@ -93,24 +187,19 @@ func (q *Queries) CountAuditLogEvents(ctx context.Context, arg CountAuditLogEven
 	return count, err
 }
 
-const countDevices = `-- name: CountDevices :one
-SELECT COUNT(*) FROM device_identity WHERE app_id = $1
+const countDevicesOnUpdate = `-- name: CountDevicesOnUpdate :one
+SELECT COUNT(*) FROM device_identity
+WHERE app_id = $1 AND current_update_id = $2
 `
 
-func (q *Queries) CountDevices(ctx context.Context, appID pgtype.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countDevices, appID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
+type CountDevicesOnUpdateParams struct {
+	AppID           pgtype.UUID `json:"app_id"`
+	CurrentUpdateID pgtype.UUID `json:"current_update_id"`
 }
 
-const countGrantsByRole = `-- name: CountGrantsByRole :one
-SELECT COUNT(*) FROM user_app_grants
-WHERE role_id = $1
-`
-
-func (q *Queries) CountGrantsByRole(ctx context.Context, roleID pgtype.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countGrantsByRole, roleID)
+// Instant-T adoption: how many devices currently run this update.
+func (q *Queries) CountDevicesOnUpdate(ctx context.Context, arg CountDevicesOnUpdateParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countDevicesOnUpdate, arg.AppID, arg.CurrentUpdateID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -149,21 +238,160 @@ func (q *Queries) CountGrantsPerUser(ctx context.Context) ([]CountGrantsPerUserR
 	return items, nil
 }
 
-const decrementIdentityValueStat = `-- name: DecrementIdentityValueStat :exec
-UPDATE identity_value_stats
-SET device_count = GREATEST(device_count - 1, 0)
-WHERE app_id = $1 AND key = $2 AND value = $3
+const countObserveActiveDevices = `-- name: CountObserveActiveDevices :one
+SELECT COUNT(*)
+FROM device_identity d
+WHERE d.app_id = $1
+  AND d.last_seen_at >= $2::timestamptz
+  AND (coalesce(cardinality($3::jsonb[]), 0) = 0 OR d.metadata @> ANY($3::jsonb[]))
+  AND (coalesce(cardinality($4::uuid[]), 0) = 0 OR d.eas_client_id = ANY($4::uuid[]))
+  AND (coalesce(cardinality($5::uuid[]), 0) = 0 OR d.current_update_id = ANY($5::uuid[]))
+  AND (coalesce(cardinality($6::uuid[]), 0) = 0 OR d.publish_group = ANY($6::uuid[]))
+  AND (coalesce(cardinality($7::text[]), 0) = 0 OR d.device_model = ANY($7::text[]))
+  AND (coalesce(cardinality($8::text[]), 0) = 0 OR d.os_name = ANY($8::text[]))
+  AND (coalesce(cardinality($9::text[]), 0) = 0 OR d.os_version = ANY($9::text[]))
+  AND (coalesce(cardinality($10::text[]), 0) = 0 OR d.country_code = ANY($10::text[]))
+  AND (coalesce(cardinality($11::text[]), 0) = 0 OR d.branch_name = ANY($11::text[]))
+  AND (coalesce(cardinality($12::text[]), 0) = 0 OR d.runtime_version = ANY($12::text[]))
+  AND (coalesce(cardinality($13::text[]), 0) = 0 OR d.platform = ANY($13::text[]))
 `
 
-type DecrementIdentityValueStatParams struct {
-	AppID pgtype.UUID `json:"app_id"`
-	Key   string      `json:"key"`
-	Value string      `json:"value"`
+type CountObserveActiveDevicesParams struct {
+	AppID           pgtype.UUID        `json:"app_id"`
+	ActiveSince     pgtype.Timestamptz `json:"active_since"`
+	Filters         [][]byte           `json:"filters"`
+	EasClientID     []pgtype.UUID      `json:"eas_client_id"`
+	CurrentUpdateID []pgtype.UUID      `json:"current_update_id"`
+	PublishGroup    []pgtype.UUID      `json:"publish_group"`
+	DeviceModel     []string           `json:"device_model"`
+	OsName          []string           `json:"os_name"`
+	OsVersion       []string           `json:"os_version"`
+	CountryCode     []string           `json:"country_code"`
+	Branch          []string           `json:"branch"`
+	RuntimeVersion  []string           `json:"runtime_version"`
+	Platform        []string           `json:"platform"`
 }
 
-func (q *Queries) DecrementIdentityValueStat(ctx context.Context, arg DecrementIdentityValueStatParams) error {
-	_, err := q.db.Exec(ctx, decrementIdentityValueStat, arg.AppID, arg.Key, arg.Value)
-	return err
+// Real-time active installs for Observe. Unlike telemetry aggregates this
+// stays available when ClickHouse is disabled.
+//
+// Same filter predicates as ListObserveLocations, for the same reason: this
+// number sits next to the map and the tables on one filtered page. Counting the
+// whole fleet while the page is narrowed to a branch is the same lie the map
+// would tell.
+func (q *Queries) CountObserveActiveDevices(ctx context.Context, arg CountObserveActiveDevicesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countObserveActiveDevices,
+		arg.AppID,
+		arg.ActiveSince,
+		arg.Filters,
+		arg.EasClientID,
+		arg.CurrentUpdateID,
+		arg.PublishGroup,
+		arg.DeviceModel,
+		arg.OsName,
+		arg.OsVersion,
+		arg.CountryCode,
+		arg.Branch,
+		arg.RuntimeVersion,
+		arg.Platform,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineDevices = `-- name: CountOnlineDevices :one
+SELECT count(*)
+FROM device_identity d
+WHERE d.app_id = $1
+  AND d.last_seen_at > $2::timestamptz
+  AND (coalesce(cardinality($3::jsonb[]), 0) = 0 OR d.metadata @> ANY($3::jsonb[]))
+  AND (coalesce(cardinality($4::uuid[]), 0) = 0 OR d.eas_client_id = ANY($4::uuid[]))
+  AND (coalesce(cardinality($5::uuid[]), 0) = 0 OR d.current_update_id = ANY($5::uuid[]))
+  AND (coalesce(cardinality($6::uuid[]), 0) = 0 OR d.publish_group = ANY($6::uuid[]))
+  AND (coalesce(cardinality($7::text[]), 0) = 0 OR d.device_model = ANY($7::text[]))
+  AND (coalesce(cardinality($8::text[]), 0) = 0 OR d.os_name = ANY($8::text[]))
+  AND (coalesce(cardinality($9::text[]), 0) = 0 OR d.os_version = ANY($9::text[]))
+  AND (coalesce(cardinality($10::text[]), 0) = 0 OR d.country_code = ANY($10::text[]))
+  AND (coalesce(cardinality($11::text[]), 0) = 0 OR d.branch_name = ANY($11::text[]))
+  AND (coalesce(cardinality($12::text[]), 0) = 0 OR d.runtime_version = ANY($12::text[]))
+  AND (coalesce(cardinality($13::text[]), 0) = 0 OR d.platform = ANY($13::text[]))
+`
+
+type CountOnlineDevicesParams struct {
+	AppID           pgtype.UUID        `json:"app_id"`
+	Since           pgtype.Timestamptz `json:"since"`
+	Filters         [][]byte           `json:"filters"`
+	EasClientID     []pgtype.UUID      `json:"eas_client_id"`
+	CurrentUpdateID []pgtype.UUID      `json:"current_update_id"`
+	PublishGroup    []pgtype.UUID      `json:"publish_group"`
+	DeviceModel     []string           `json:"device_model"`
+	OsName          []string           `json:"os_name"`
+	OsVersion       []string           `json:"os_version"`
+	CountryCode     []string           `json:"country_code"`
+	Branch          []string           `json:"branch"`
+	RuntimeVersion  []string           `json:"runtime_version"`
+	Platform        []string           `json:"platform"`
+}
+
+// Devices that pinged in the last N minutes, whatever the ping: a manifest
+// poll, a metrics batch or a log batch all bump last_seen_at, so this is
+// "currently live", not "currently sending telemetry". Served by
+// idx_device_identity_last_seen. The check-in debounce means last_seen_at is
+// accurate to within a minute, which is invisible at a 20 minute window.
+//
+// Filtered on the same dimensions as ListDevices, so the count sits next to a
+// filtered inventory without contradicting it, and now by the same means: every
+// dimension is a plain predicate on device_identity.
+//
+// This query used to reach the release dimensions through a subquery over
+// updates, hashed once, because the three-way join ListDevices carried was
+// unaffordable on a whole-fleet count. Measured then on 2.4M online devices,
+// 20 minute window: 586 ms unfiltered and 1 025 ms with a branch filter using
+// the joins, against 45 ms and 112 ms using the subquery. With the dimensions
+// stored on the device the subquery is gone too, along with the two traps it
+// carried (the leading cardinality check that kept "no release filter" from
+// meaning "only updates I know", and the ban on correlating it to the outer
+// row, which cost 9 seconds when someone tried).
+func (q *Queries) CountOnlineDevices(ctx context.Context, arg CountOnlineDevicesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineDevices,
+		arg.AppID,
+		arg.Since,
+		arg.Filters,
+		arg.EasClientID,
+		arg.CurrentUpdateID,
+		arg.PublishGroup,
+		arg.DeviceModel,
+		arg.OsName,
+		arg.OsVersion,
+		arg.CountryCode,
+		arg.Branch,
+		arg.RuntimeVersion,
+		arg.Platform,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUpdateFailures = `-- name: CountUpdateFailures :one
+SELECT COUNT(DISTINCT eas_client_id) FROM device_update_failures
+WHERE app_id = $1 AND update_id = $2 AND resolved_at IS NULL
+`
+
+type CountUpdateFailuresParams struct {
+	AppID    pgtype.UUID `json:"app_id"`
+	UpdateID pgtype.UUID `json:"update_id"`
+}
+
+// Instant-T health: how many devices this update crashed on at launch.
+// DISTINCT on the device: one device can hold both a launch rollback and a
+// runtime crash for the same update, which is two rows and one device.
+func (q *Queries) CountUpdateFailures(ctx context.Context, arg CountUpdateFailuresParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countUpdateFailures, arg.AppID, arg.UpdateID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const deleteAppByID = `-- name: DeleteAppByID :execresult
@@ -225,18 +453,13 @@ func (q *Queries) DeleteChannelRollout(ctx context.Context, arg DeleteChannelRol
 	return result.RowsAffected(), nil
 }
 
-const deleteDevices = `-- name: DeleteDevices :exec
-DELETE FROM device_identity
-WHERE app_id = $1 AND eas_client_id = ANY($2::uuid[])
+const deleteDeviceHealthOutbox = `-- name: DeleteDeviceHealthOutbox :exec
+DELETE FROM device_health_outbox
+WHERE id = ANY($1::bigint[])
 `
 
-type DeleteDevicesParams struct {
-	AppID     pgtype.UUID   `json:"app_id"`
-	ClientIds []pgtype.UUID `json:"client_ids"`
-}
-
-func (q *Queries) DeleteDevices(ctx context.Context, arg DeleteDevicesParams) error {
-	_, err := q.db.Exec(ctx, deleteDevices, arg.AppID, arg.ClientIds)
+func (q *Queries) DeleteDeviceHealthOutbox(ctx context.Context, ids []int64) error {
+	_, err := q.db.Exec(ctx, deleteDeviceHealthOutbox, ids)
 	return err
 }
 
@@ -332,21 +555,80 @@ func (q *Queries) DeleteUserByID(ctx context.Context, id pgtype.UUID) (pgconn.Co
 
 const deleteZeroIdentityValueStats = `-- name: DeleteZeroIdentityValueStats :exec
 DELETE FROM identity_value_stats
-WHERE app_id = $1 AND key = $2 AND value = $3 AND device_count <= 0
+WHERE app_id = $1
+  AND device_count <= 0
+  AND (key, value) IN (
+      SELECT unnest($2::TEXT[]), unnest($3::TEXT[])
+  )
 `
 
 type DeleteZeroIdentityValueStatsParams struct {
-	AppID pgtype.UUID `json:"app_id"`
-	Key   string      `json:"key"`
-	Value string      `json:"value"`
+	AppID  pgtype.UUID `json:"app_id"`
+	Keys   []string    `json:"keys"`
+	Values []string    `json:"values"`
 }
 
+// Sweeps the rows the statement above left at zero, in one pass over the pairs
+// it touched. Same rows, already locked by it, so this introduces no new
+// ordering.
 func (q *Queries) DeleteZeroIdentityValueStats(ctx context.Context, arg DeleteZeroIdentityValueStatsParams) error {
-	_, err := q.db.Exec(ctx, deleteZeroIdentityValueStats, arg.AppID, arg.Key, arg.Value)
+	_, err := q.db.Exec(ctx, deleteZeroIdentityValueStats, arg.AppID, arg.Keys, arg.Values)
 	return err
 }
 
-const ensureDeviceIdentity = `-- name: EnsureDeviceIdentity :execrows
+const devicesOnUpdateByIDs = `-- name: DevicesOnUpdateByIDs :many
+SELECT current_update_id AS update_uuid, COUNT(*) AS device_count
+FROM device_identity
+WHERE app_id = $1
+  AND current_update_id = ANY($2::uuid[])
+GROUP BY current_update_id
+`
+
+type DevicesOnUpdateByIDsParams struct {
+	AppID     pgtype.UUID   `json:"app_id"`
+	UpdateIds []pgtype.UUID `json:"update_ids"`
+}
+
+type DevicesOnUpdateByIDsRow struct {
+	UpdateUuid  pgtype.UUID `json:"update_uuid"`
+	DeviceCount int64       `json:"device_count"`
+}
+
+// Batch adoption counts for a set of updates: every device CURRENTLY running
+// each update (the dashboard's "Devices" column).
+func (q *Queries) DevicesOnUpdateByIDs(ctx context.Context, arg DevicesOnUpdateByIDsParams) ([]DevicesOnUpdateByIDsRow, error) {
+	rows, err := q.db.Query(ctx, devicesOnUpdateByIDs, arg.AppID, arg.UpdateIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DevicesOnUpdateByIDsRow
+	for rows.Next() {
+		var i DevicesOnUpdateByIDsRow
+		if err := rows.Scan(&i.UpdateUuid, &i.DeviceCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const discardDeviceHealthOutbox = `-- name: DiscardDeviceHealthOutbox :exec
+DELETE FROM device_health_outbox
+`
+
+// A deployment with no ClickHouse has no historical-health consumer. Its
+// uniform no-ClickHouse replicas periodically discard this otherwise
+// unbounded queue; PostgreSQL instant-T health does not depend on it.
+func (q *Queries) DiscardDeviceHealthOutbox(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, discardDeviceHealthOutbox)
+	return err
+}
+
+const ensureDeviceIdentity = `-- name: EnsureDeviceIdentity :exec
 INSERT INTO device_identity (app_id, eas_client_id)
 VALUES ($1, $2)
 ON CONFLICT (app_id, eas_client_id) DO NOTHING
@@ -361,15 +643,9 @@ type EnsureDeviceIdentityParams struct {
 // purpose: FOR UPDATE cannot lock a row that does not exist yet, so two
 // concurrent first identifies of the same install would both merge against
 // an empty map and one would silently win. Insert-then-lock serializes them.
-// Returns the number of rows inserted: 1 when this install is brand new, 0
-// when it already existed. The free-tier device cap only needs to run on a
-// genuine new-device insert, so the caller keys the count/eviction off this.
-func (q *Queries) EnsureDeviceIdentity(ctx context.Context, arg EnsureDeviceIdentityParams) (int64, error) {
-	result, err := q.db.Exec(ctx, ensureDeviceIdentity, arg.AppID, arg.EasClientID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+func (q *Queries) EnsureDeviceIdentity(ctx context.Context, arg EnsureDeviceIdentityParams) error {
+	_, err := q.db.Exec(ctx, ensureDeviceIdentity, arg.AppID, arg.EasClientID)
+	return err
 }
 
 const getActiveRolloutUpdates = `-- name: GetActiveRolloutUpdates :many
@@ -981,7 +1257,7 @@ func (q *Queries) GetChannelsByAppID(ctx context.Context, appID pgtype.UUID) ([]
 }
 
 const getDeviceIdentity = `-- name: GetDeviceIdentity :one
-SELECT app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at FROM device_identity
+SELECT app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at, current_update_id, device_model, os_name, os_version, branch_name, runtime_version, platform, publish_group, app_version, current_update_observed_at, current_update_arrived_at FROM device_identity
 WHERE app_id = $1 AND eas_client_id = $2
 `
 
@@ -1003,12 +1279,23 @@ func (q *Queries) GetDeviceIdentity(ctx context.Context, arg GetDeviceIdentityPa
 		&i.Lng,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.CurrentUpdateID,
+		&i.DeviceModel,
+		&i.OsName,
+		&i.OsVersion,
+		&i.BranchName,
+		&i.RuntimeVersion,
+		&i.Platform,
+		&i.PublishGroup,
+		&i.AppVersion,
+		&i.CurrentUpdateObservedAt,
+		&i.CurrentUpdateArrivedAt,
 	)
 	return i, err
 }
 
 const getDeviceIdentityForUpdate = `-- name: GetDeviceIdentityForUpdate :one
-SELECT app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at FROM device_identity
+SELECT app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at, current_update_id, device_model, os_name, os_version, branch_name, runtime_version, platform, publish_group, app_version, current_update_observed_at, current_update_arrived_at FROM device_identity
 WHERE app_id = $1 AND eas_client_id = $2
 FOR UPDATE
 `
@@ -1031,6 +1318,17 @@ func (q *Queries) GetDeviceIdentityForUpdate(ctx context.Context, arg GetDeviceI
 		&i.Lng,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.CurrentUpdateID,
+		&i.DeviceModel,
+		&i.OsName,
+		&i.OsVersion,
+		&i.BranchName,
+		&i.RuntimeVersion,
+		&i.Platform,
+		&i.PublishGroup,
+		&i.AppVersion,
+		&i.CurrentUpdateObservedAt,
+		&i.CurrentUpdateArrivedAt,
 	)
 	return i, err
 }
@@ -1606,6 +1904,35 @@ func (q *Queries) GetUpdateMetadata(ctx context.Context, arg GetUpdateMetadataPa
 	return i, err
 }
 
+const getUpdateOriginByUUID = `-- name: GetUpdateOriginByUUID :one
+SELECT b.name AS branch_name, u.publish_group
+FROM updates u
+INNER JOIN branches b ON u.branch_id = b.id
+WHERE b.app_id = $1 AND u.update_uuid = $2
+LIMIT 1
+`
+
+type GetUpdateOriginByUUIDParams struct {
+	AppID      pgtype.UUID `json:"app_id"`
+	UpdateUuid pgtype.UUID `json:"update_uuid"`
+}
+
+type GetUpdateOriginByUUIDRow struct {
+	BranchName   string      `json:"branch_name"`
+	PublishGroup pgtype.UUID `json:"publish_group"`
+}
+
+// Same lookup, one row: the flattener needs both the branch and the publish
+// group of an update, and one round trip beats two. publish_group is NULL for
+// updates from older CLIs and for rollback markers, which is why the caller
+// treats it as optional rather than as a missing row.
+func (q *Queries) GetUpdateOriginByUUID(ctx context.Context, arg GetUpdateOriginByUUIDParams) (GetUpdateOriginByUUIDRow, error) {
+	row := q.db.QueryRow(ctx, getUpdateOriginByUUID, arg.AppID, arg.UpdateUuid)
+	var i GetUpdateOriginByUUIDRow
+	err := row.Scan(&i.BranchName, &i.PublishGroup)
+	return i, err
+}
+
 const getUpdateType = `-- name: GetUpdateType :one
 SELECT u.update_type 
 FROM updates u
@@ -1959,25 +2286,6 @@ func (q *Queries) HasActiveRolloutUpdate(ctx context.Context, arg HasActiveRollo
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
-}
-
-const incrementIdentityValueStat = `-- name: IncrementIdentityValueStat :exec
-INSERT INTO identity_value_stats (app_id, key, value, device_count)
-VALUES ($1, $2, $3, 1)
-ON CONFLICT (app_id, key, value) DO UPDATE SET
-    device_count = identity_value_stats.device_count + 1,
-    last_seen_at = CURRENT_TIMESTAMP
-`
-
-type IncrementIdentityValueStatParams struct {
-	AppID pgtype.UUID `json:"app_id"`
-	Key   string      `json:"key"`
-	Value string      `json:"value"`
-}
-
-func (q *Queries) IncrementIdentityValueStat(ctx context.Context, arg IncrementIdentityValueStatParams) error {
-	_, err := q.db.Exec(ctx, incrementIdentityValueStat, arg.AppID, arg.Key, arg.Value)
-	return err
 }
 
 const insertApiKey = `-- name: InsertApiKey :one
@@ -2687,36 +2995,319 @@ func (q *Queries) ListAuditLogEventsAfter(ctx context.Context, arg ListAuditLogE
 	return items, nil
 }
 
+const listCurrentUpdateHealthSnapshots = `-- name: ListCurrentUpdateHealthSnapshots :many
+WITH latest AS (
+    SELECT DISTINCT ON (u.branch_id, u.runtime_version_id, u.platform)
+           b.app_id,
+           u.branch_id,
+           u.runtime_version_id,
+           u.platform,
+           u.update_uuid,
+           u.rollout_percentage,
+           u.control_update_id
+    FROM updates u
+    JOIN branches b ON b.id = u.branch_id
+    WHERE u.checked_at IS NOT NULL
+    ORDER BY u.branch_id, u.runtime_version_id, u.platform, u.id DESC
+),
+adoption AS (
+    SELECT app_id, current_update_id AS update_uuid, COUNT(*) AS devices_on_update
+    FROM device_identity
+    WHERE current_update_id IS NOT NULL
+    GROUP BY app_id, current_update_id
+),
+tracked AS (
+    SELECT app_id,
+           update_uuid,
+           CASE WHEN rollout_percentage IS NULL THEN 'current' ELSE 'candidate' END::text AS role
+    FROM latest
+    WHERE update_uuid IS NOT NULL
+
+    UNION ALL
+
+    SELECT l.app_id, control.update_uuid, 'control'::text AS role
+    FROM latest l
+    JOIN updates control
+      ON control.branch_id = l.branch_id
+     AND control.id = l.control_update_id
+    WHERE l.rollout_percentage IS NOT NULL
+      AND control.update_uuid IS NOT NULL
+),
+relevant AS (
+    SELECT app_id, update_uuid, role FROM tracked
+
+    UNION ALL
+
+    -- Restricted to updates this server published: a device reporting an id
+    -- nobody knows must not mint a series for an update that does not exist.
+    SELECT a.app_id, a.update_uuid, 'legacy'::text AS role
+    FROM adoption a
+    WHERE NOT EXISTS (
+        SELECT 1 FROM tracked t
+        WHERE t.app_id = a.app_id AND t.update_uuid = a.update_uuid
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM updates u
+        JOIN branches b ON b.id = u.branch_id
+        WHERE b.app_id = a.app_id AND u.update_uuid = a.update_uuid
+    )
+)
+SELECT r.app_id,
+       r.update_uuid,
+       r.role,
+       COALESCE(adoption.devices_on_update, 0)::bigint AS devices_on_update,
+       (COALESCE(adoption.devices_on_update, 0) - COALESCE(failures.still_on_update, 0))::bigint AS successful_devices,
+       COALESCE(failures.faulty_devices, 0)::bigint AS faulty_devices,
+       COALESCE(failures.update_issues, 0)::bigint AS update_issues,
+       COALESCE(failures.runtime_issues, 0)::bigint AS runtime_issues
+FROM relevant r
+LEFT JOIN adoption ON adoption.app_id = r.app_id AND adoption.update_uuid = r.update_uuid
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS faulty_devices,
+           COUNT(*) FILTER (WHERE f.failure_type = 'update_issue') AS update_issues,
+           COUNT(*) FILTER (WHERE f.failure_type = 'runtime_issue') AS runtime_issues,
+           COUNT(*) FILTER (
+               WHERE EXISTS (
+                   SELECT 1
+                   FROM device_identity d
+                   WHERE d.app_id = f.app_id
+                     AND d.eas_client_id = f.eas_client_id
+                     AND d.current_update_id = f.update_id
+               )
+           ) AS still_on_update
+    FROM device_update_failures f
+    WHERE f.app_id = r.app_id
+      AND f.update_id = r.update_uuid
+      AND f.resolved_at IS NULL
+) failures ON TRUE
+`
+
+type ListCurrentUpdateHealthSnapshotsRow struct {
+	AppID             pgtype.UUID `json:"app_id"`
+	UpdateUuid        pgtype.UUID `json:"update_uuid"`
+	Role              string      `json:"role"`
+	DevicesOnUpdate   int64       `json:"devices_on_update"`
+	SuccessfulDevices int64       `json:"successful_devices"`
+	FaultyDevices     int64       `json:"faulty_devices"`
+	UpdateIssues      int64       `json:"update_issues"`
+	RuntimeIssues     int64       `json:"runtime_issues"`
+}
+
+func (q *Queries) ListCurrentUpdateHealthSnapshots(ctx context.Context) ([]ListCurrentUpdateHealthSnapshotsRow, error) {
+	rows, err := q.db.Query(ctx, listCurrentUpdateHealthSnapshots)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCurrentUpdateHealthSnapshotsRow
+	for rows.Next() {
+		var i ListCurrentUpdateHealthSnapshotsRow
+		if err := rows.Scan(
+			&i.AppID,
+			&i.UpdateUuid,
+			&i.Role,
+			&i.DevicesOnUpdate,
+			&i.SuccessfulDevices,
+			&i.FaultyDevices,
+			&i.UpdateIssues,
+			&i.RuntimeIssues,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDeviceHealthOutbox = `-- name: ListDeviceHealthOutbox :many
+SELECT o.id, o.event_type, o.app_id, o.eas_client_id, o.update_id, o.previous_update_id,
+       o.failure_type, o.fatal_error, o.occurred_at,
+       coalesce(b.name, '') AS branch,
+       coalesce(rv.version, '') AS runtime_version,
+       coalesce(u.platform, '') AS platform,
+       coalesce(d.os_name, '') AS os_name,
+       coalesce(d.os_version, '') AS os_version,
+       coalesce(d.device_model, '') AS device_model,
+       coalesce(d.country_code, '') AS country_code,
+       coalesce(d.app_version, '') AS app_version
+FROM device_health_outbox o
+LEFT JOIN updates u ON u.update_uuid = o.update_id
+    AND EXISTS (
+        SELECT 1 FROM branches ub
+        WHERE ub.id = u.branch_id AND ub.app_id = o.app_id
+    )
+LEFT JOIN branches b ON b.id = u.branch_id AND b.app_id = o.app_id
+LEFT JOIN runtime_versions rv ON rv.id = u.runtime_version_id
+LEFT JOIN device_identity d ON d.app_id = o.app_id AND d.eas_client_id = o.eas_client_id
+ORDER BY o.id
+LIMIT $1
+`
+
+type ListDeviceHealthOutboxRow struct {
+	ID               int64              `json:"id"`
+	EventType        string             `json:"event_type"`
+	AppID            pgtype.UUID        `json:"app_id"`
+	EasClientID      pgtype.UUID        `json:"eas_client_id"`
+	UpdateID         pgtype.UUID        `json:"update_id"`
+	PreviousUpdateID pgtype.UUID        `json:"previous_update_id"`
+	FailureType      *string            `json:"failure_type"`
+	FatalError       string             `json:"fatal_error"`
+	OccurredAt       pgtype.Timestamptz `json:"occurred_at"`
+	Branch           string             `json:"branch"`
+	RuntimeVersion   string             `json:"runtime_version"`
+	Platform         string             `json:"platform"`
+	OsName           string             `json:"os_name"`
+	OsVersion        string             `json:"os_version"`
+	DeviceModel      string             `json:"device_model"`
+	CountryCode      string             `json:"country_code"`
+	AppVersion       string             `json:"app_version"`
+}
+
+// Durable ClickHouse delivery queue. The worker reads through a transaction;
+// SKIP LOCKED lets several API replicas drain disjoint batches safely.
+// The outbox carries ids; the analytical store wants the dimensions that go
+// with them, so they are resolved here, once, on a bounded batch. The update
+// side is permanent (an update never changes branch), the device side is the
+// hardware as currently known, which is what a crash is read against.
+// Deliberately NOT "FOR UPDATE SKIP LOCKED" any more. The row lock used to be
+// what stopped two replicas delivering the same event, and it worked, but it
+// only holds for the life of its transaction: the delivery had to keep that
+// transaction open across the ClickHouse insert, so an unreachable ClickHouse
+// pinned a connection and a transaction id, and a transaction id that never
+// advances stops vacuum from cleaning a table that takes an event per device
+// state change.
+//
+// Mutual exclusion moved to a session advisory lock taken by the caller, which
+// costs no transaction. What guards against a double delivery afterwards is
+// the destination: device_health_events is a ReplacingMergeTree keyed on
+// (app_id, outbox_id), so the same event delivered twice collapses.
+// The EXISTS scopes the update to the event's app, not just its uuid. update_id
+// originates from an unauthenticated header, so a device of app A can name an
+// update of app B: without it, `branch` correctly resolves to ” (that join IS
+// app-scoped) while platform and runtime_version, which hang off this join,
+// would carry B's values into A's analytics rows. Same guard the device
+// inventory carried before its dimensions moved onto device_identity.
+//
+// Read from the update rather than from `d`, which now stores the same
+// dimensions: `d` describes the update the device runs NOW, and an outbox event
+// is about the update it names, which for a rollback or a switch is a different
+// one.
+func (q *Queries) ListDeviceHealthOutbox(ctx context.Context, limit int32) ([]ListDeviceHealthOutboxRow, error) {
+	rows, err := q.db.Query(ctx, listDeviceHealthOutbox, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDeviceHealthOutboxRow
+	for rows.Next() {
+		var i ListDeviceHealthOutboxRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventType,
+			&i.AppID,
+			&i.EasClientID,
+			&i.UpdateID,
+			&i.PreviousUpdateID,
+			&i.FailureType,
+			&i.FatalError,
+			&i.OccurredAt,
+			&i.Branch,
+			&i.RuntimeVersion,
+			&i.Platform,
+			&i.OsName,
+			&i.OsVersion,
+			&i.DeviceModel,
+			&i.CountryCode,
+			&i.AppVersion,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDevices = `-- name: ListDevices :many
-SELECT app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at FROM device_identity
-WHERE app_id = $1
-  AND ($2::jsonb IS NULL OR metadata @> $2::jsonb)
+SELECT d.app_id, d.eas_client_id, d.metadata, d.country_code, d.city, d.lat, d.lng, d.first_seen_at, d.last_seen_at, d.current_update_id, d.device_model, d.os_name, d.os_version, d.branch_name, d.runtime_version, d.platform, d.publish_group, d.app_version, d.current_update_observed_at, d.current_update_arrived_at
+FROM device_identity d
+WHERE d.app_id = $1
+  AND (coalesce(cardinality($2::jsonb[]), 0) = 0 OR d.metadata @> ANY($2::jsonb[]))
+  AND (coalesce(cardinality($3::uuid[]), 0) = 0 OR d.eas_client_id = ANY($3::uuid[]))
+  AND (coalesce(cardinality($4::uuid[]), 0) = 0 OR d.current_update_id = ANY($4::uuid[]))
+  AND (coalesce(cardinality($5::uuid[]), 0) = 0 OR d.publish_group = ANY($5::uuid[]))
+  AND (coalesce(cardinality($6::text[]), 0) = 0 OR d.device_model = ANY($6::text[]))
+  AND (coalesce(cardinality($7::text[]), 0) = 0 OR d.os_name = ANY($7::text[]))
+  AND (coalesce(cardinality($8::text[]), 0) = 0 OR d.os_version = ANY($8::text[]))
+  AND (coalesce(cardinality($9::text[]), 0) = 0 OR d.country_code = ANY($9::text[]))
+  AND (coalesce(cardinality($10::text[]), 0) = 0 OR d.branch_name = ANY($10::text[]))
+  AND (coalesce(cardinality($11::text[]), 0) = 0 OR d.runtime_version = ANY($11::text[]))
+  AND (coalesce(cardinality($12::text[]), 0) = 0 OR d.platform = ANY($12::text[]))
   AND (
-    $3::timestamptz IS NULL
-    OR last_seen_at < $3::timestamptz
-    OR (last_seen_at = $3::timestamptz
-        AND eas_client_id < $4::uuid)
+    $13::timestamptz IS NULL
+    OR d.last_seen_at < $13::timestamptz
+    OR (d.last_seen_at = $13::timestamptz
+        AND d.eas_client_id < $14::uuid)
   )
-ORDER BY last_seen_at DESC, eas_client_id DESC
-LIMIT $5::int
+ORDER BY d.last_seen_at DESC, d.eas_client_id DESC
+LIMIT $15::int
 `
 
 type ListDevicesParams struct {
-	AppID          pgtype.UUID        `json:"app_id"`
-	Filter         []byte             `json:"filter"`
-	BeforeLastSeen pgtype.Timestamptz `json:"before_last_seen"`
-	BeforeClientID pgtype.UUID        `json:"before_client_id"`
-	Lim            int32              `json:"lim"`
+	AppID           pgtype.UUID        `json:"app_id"`
+	Filters         [][]byte           `json:"filters"`
+	EasClientID     []pgtype.UUID      `json:"eas_client_id"`
+	CurrentUpdateID []pgtype.UUID      `json:"current_update_id"`
+	PublishGroup    []pgtype.UUID      `json:"publish_group"`
+	DeviceModel     []string           `json:"device_model"`
+	OsName          []string           `json:"os_name"`
+	OsVersion       []string           `json:"os_version"`
+	CountryCode     []string           `json:"country_code"`
+	Branch          []string           `json:"branch"`
+	RuntimeVersion  []string           `json:"runtime_version"`
+	Platform        []string           `json:"platform"`
+	BeforeLastSeen  pgtype.Timestamptz `json:"before_last_seen"`
+	BeforeClientID  pgtype.UUID        `json:"before_client_id"`
+	Lim             int32              `json:"lim"`
 }
 
-// Device inventory for the dashboard: newest-seen first, keyset-paginated on
+// Device inventory for the dashboard, with the release dimensions of whatever
+// update each device currently runs: newest-seen first, keyset-paginated on
 // (last_seen_at DESC, eas_client_id DESC) so deep pages stay cheap. The
-// optional jsonb filter (metadata @> $filter, served by the GIN index) powers
+// optional jsonb filters (metadata @> ANY, served by the GIN index) power
 // "devices for a userId / tenant". Fetch one extra row to detect the next page.
+//
+// branch, runtime version, platform and publish group are properties of the
+// update and never change, so they are stored on the device at check-in rather
+// than joined back here (20260726120000_device_release_columns.sql). The
+// app-scoping guard that used to live in this query, as an EXISTS on the
+// updates join, moved to the write with them: a device of app A claiming an
+// update of app B resolves to nothing there and reads NULL here.
+//
+// NULL, deliberately: a device on the embedded bundle, or on an update this
+// server does not know, still appears in the unfiltered inventory. Filtering on
+// a release dimension does exclude it, which is the honest answer to "show me
+// devices on branch X".
 func (q *Queries) ListDevices(ctx context.Context, arg ListDevicesParams) ([]DeviceIdentity, error) {
 	rows, err := q.db.Query(ctx, listDevices,
 		arg.AppID,
-		arg.Filter,
+		arg.Filters,
+		arg.EasClientID,
+		arg.CurrentUpdateID,
+		arg.PublishGroup,
+		arg.DeviceModel,
+		arg.OsName,
+		arg.OsVersion,
+		arg.CountryCode,
+		arg.Branch,
+		arg.RuntimeVersion,
+		arg.Platform,
 		arg.BeforeLastSeen,
 		arg.BeforeClientID,
 		arg.Lim,
@@ -2738,6 +3329,17 @@ func (q *Queries) ListDevices(ctx context.Context, arg ListDevicesParams) ([]Dev
 			&i.Lng,
 			&i.FirstSeenAt,
 			&i.LastSeenAt,
+			&i.CurrentUpdateID,
+			&i.DeviceModel,
+			&i.OsName,
+			&i.OsVersion,
+			&i.BranchName,
+			&i.RuntimeVersion,
+			&i.Platform,
+			&i.PublishGroup,
+			&i.AppVersion,
+			&i.CurrentUpdateObservedAt,
+			&i.CurrentUpdateArrivedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -2785,6 +3387,206 @@ func (q *Queries) ListIdentitySchemaKeys(ctx context.Context, appID pgtype.UUID)
 	return items, nil
 }
 
+const listObserveCohortDeviceIDs = `-- name: ListObserveCohortDeviceIDs :many
+SELECT eas_client_id FROM device_identity
+WHERE app_id = $1
+  AND last_seen_at >= $2::timestamptz
+  AND metadata @> ANY($3::jsonb[])
+ORDER BY last_seen_at DESC, eas_client_id DESC
+LIMIT $4::int
+`
+
+type ListObserveCohortDeviceIDsParams struct {
+	AppID       pgtype.UUID        `json:"app_id"`
+	ActiveSince pgtype.Timestamptz `json:"active_since"`
+	Filters     [][]byte           `json:"filters"`
+	Lim         int32              `json:"lim"`
+}
+
+// The current Identity cohort is projected into ClickHouse queries as an
+// external table. The JSONB containment predicate is served by the metadata
+// GIN index and keeps mutable identity data out of the analytics store.
+//
+// One containment document per requested value, so "plan is pro or
+// enterprise" is a single index scan: GIN honours @> ANY(array).
+//
+// Bounded, because the whole result is materialized in memory and then copied
+// onto the wire as an external table, on every Observe request. A broad
+// filter over a large fleet is otherwise millions of UUIDs per request. The
+// caller fetches one extra row to tell "exactly at the cap" from "truncated"
+// and says so in the response rather than silently answering for a subset.
+func (q *Queries) ListObserveCohortDeviceIDs(ctx context.Context, arg ListObserveCohortDeviceIDsParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listObserveCohortDeviceIDs,
+		arg.AppID,
+		arg.ActiveSince,
+		arg.Filters,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var eas_client_id pgtype.UUID
+		if err := rows.Scan(&eas_client_id); err != nil {
+			return nil, err
+		}
+		items = append(items, eas_client_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listObserveLocations = `-- name: ListObserveLocations :many
+SELECT d.country_code, d.city, d.lat, d.lng, COUNT(*) AS device_count
+FROM device_identity d
+WHERE d.app_id = $1
+  AND d.last_seen_at >= $2::timestamptz
+  AND d.lat IS NOT NULL
+  AND d.lng IS NOT NULL
+  AND (coalesce(cardinality($3::jsonb[]), 0) = 0 OR d.metadata @> ANY($3::jsonb[]))
+  AND (coalesce(cardinality($4::uuid[]), 0) = 0 OR d.eas_client_id = ANY($4::uuid[]))
+  AND (coalesce(cardinality($5::uuid[]), 0) = 0 OR d.current_update_id = ANY($5::uuid[]))
+  AND (coalesce(cardinality($6::uuid[]), 0) = 0 OR d.publish_group = ANY($6::uuid[]))
+  AND (coalesce(cardinality($7::text[]), 0) = 0 OR d.device_model = ANY($7::text[]))
+  AND (coalesce(cardinality($8::text[]), 0) = 0 OR d.os_name = ANY($8::text[]))
+  AND (coalesce(cardinality($9::text[]), 0) = 0 OR d.os_version = ANY($9::text[]))
+  AND (coalesce(cardinality($10::text[]), 0) = 0 OR d.country_code = ANY($10::text[]))
+  AND (coalesce(cardinality($11::text[]), 0) = 0 OR d.branch_name = ANY($11::text[]))
+  AND (coalesce(cardinality($12::text[]), 0) = 0 OR d.runtime_version = ANY($12::text[]))
+  AND (coalesce(cardinality($13::text[]), 0) = 0 OR d.platform = ANY($13::text[]))
+GROUP BY d.country_code, d.city, d.lat, d.lng
+ORDER BY device_count DESC, d.country_code ASC NULLS LAST, d.city ASC NULLS LAST
+LIMIT 500
+`
+
+type ListObserveLocationsParams struct {
+	AppID           pgtype.UUID        `json:"app_id"`
+	ActiveSince     pgtype.Timestamptz `json:"active_since"`
+	Filters         [][]byte           `json:"filters"`
+	EasClientID     []pgtype.UUID      `json:"eas_client_id"`
+	CurrentUpdateID []pgtype.UUID      `json:"current_update_id"`
+	PublishGroup    []pgtype.UUID      `json:"publish_group"`
+	DeviceModel     []string           `json:"device_model"`
+	OsName          []string           `json:"os_name"`
+	OsVersion       []string           `json:"os_version"`
+	CountryCode     []string           `json:"country_code"`
+	Branch          []string           `json:"branch"`
+	RuntimeVersion  []string           `json:"runtime_version"`
+	Platform        []string           `json:"platform"`
+}
+
+type ListObserveLocationsRow struct {
+	CountryCode *string  `json:"country_code"`
+	City        *string  `json:"city"`
+	Lat         *float64 `json:"lat"`
+	Lng         *float64 `json:"lng"`
+	DeviceCount int64    `json:"device_count"`
+}
+
+// City centroids are intentionally grouped before crossing the API boundary:
+// GeoLite2 coordinates identify a city, not an exact device position.
+//
+// Two callers, one shape. With the period as active_since this is the map's
+// static layer ("installs per city"); with the last few seconds it is the
+// map's live feed ("check-ins per city since the last poll"). Aggregating is
+// what keeps the live feed affordable: the row count is bounded by geography,
+// so a 5M device fleet costs the same payload as a 5k one, and the LIMIT
+// degrades by dropping the quietest cities rather than by growing.
+//
+// The same FILTER predicates as ListDevices, deliberately: the map is a view of
+// the inventory, so narrowing the page has to narrow the map too. A globe that
+// keeps showing the whole fleet while the tables next to it show a branch is a
+// globe that lies. Only the window differs: here last_seen_at bounds the
+// period, there the keyset bounds the page.
+//
+// This used to be two queries. The release dimensions lived on the update, so
+// filtering on one meant three joins, and the planner cannot skip a join it
+// might need: carrying them unconditionally cost 4x (330ms -> 1.4s) on the
+// query that runs on every page load, filtered or not. The workaround was a
+// join-free twin picked at runtime. Now that the dimensions sit on the device
+// there is one query again, and it is the cheap one in every case.
+func (q *Queries) ListObserveLocations(ctx context.Context, arg ListObserveLocationsParams) ([]ListObserveLocationsRow, error) {
+	rows, err := q.db.Query(ctx, listObserveLocations,
+		arg.AppID,
+		arg.ActiveSince,
+		arg.Filters,
+		arg.EasClientID,
+		arg.CurrentUpdateID,
+		arg.PublishGroup,
+		arg.DeviceModel,
+		arg.OsName,
+		arg.OsVersion,
+		arg.CountryCode,
+		arg.Branch,
+		arg.RuntimeVersion,
+		arg.Platform,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListObserveLocationsRow
+	for rows.Next() {
+		var i ListObserveLocationsRow
+		if err := rows.Scan(
+			&i.CountryCode,
+			&i.City,
+			&i.Lat,
+			&i.Lng,
+			&i.DeviceCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listObserveUpdateUUIDsByPublishGroup = `-- name: ListObserveUpdateUUIDsByPublishGroup :many
+SELECT u.update_uuid
+FROM updates u
+JOIN branches b ON b.id = u.branch_id
+WHERE b.app_id = $1
+  AND u.publish_group = $2
+  AND u.update_uuid IS NOT NULL
+  AND u.checked_at IS NOT NULL
+ORDER BY u.id
+`
+
+type ListObserveUpdateUUIDsByPublishGroupParams struct {
+	AppID        pgtype.UUID `json:"app_id"`
+	PublishGroup pgtype.UUID `json:"publish_group"`
+}
+
+// Resolve an EAS publish group to the concrete update UUIDs stored on
+// telemetry rows. A publish group can contain one update per platform.
+func (q *Queries) ListObserveUpdateUUIDsByPublishGroup(ctx context.Context, arg ListObserveUpdateUUIDsByPublishGroupParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listObserveUpdateUUIDsByPublishGroup, arg.AppID, arg.PublishGroup)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var update_uuid pgtype.UUID
+		if err := rows.Scan(&update_uuid); err != nil {
+			return nil, err
+		}
+		items = append(items, update_uuid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRoles = `-- name: ListRoles :many
 SELECT id, name, permissions, created_at, updated_at FROM roles
 ORDER BY name ASC
@@ -2805,6 +3607,191 @@ func (q *Queries) ListRoles(ctx context.Context) ([]Role, error) {
 			&i.Permissions,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUpdateHealthStateDeltas = `-- name: ListUpdateHealthStateDeltas :many
+WITH failure_islands AS (
+    -- A device is failing on an update from its first fault until its last one
+    -- clears, and one device counts ONCE however many faults it holds: since
+    -- 20260726140000_failure_type_in_key.sql a launch rollback and a JS crash
+    -- on the same pair are two rows by design, and counting rows let the
+    -- failing curve climb above the population it is drawn against.
+    --
+    -- Merged rather than collapsed to one span, though. Taking MIN(first_seen)
+    -- and MAX(resolved) over every row of the device would bridge the gap
+    -- between two faults that did not overlap: a device that failed at 09:00,
+    -- recovered at 09:30 and crashed again at 14:00 would have read as failing
+    -- for the five healthy hours in between, and its second fault would have
+    -- been dated five hours early. So overlapping faults merge and disjoint
+    -- ones stay apart, which is the standard islands walk below.
+    SELECT update_id,
+           eas_client_id,
+           MIN(first_seen_at) AS opened_at,
+           CASE WHEN bool_or(resolved_at IS NULL) THEN NULL ELSE MAX(resolved_at) END AS closed_at
+    FROM (
+        SELECT update_id, eas_client_id, first_seen_at, resolved_at,
+               SUM(CASE WHEN prev_end IS NULL OR first_seen_at > prev_end THEN 1 ELSE 0 END)
+                   OVER (PARTITION BY update_id, eas_client_id ORDER BY first_seen_at) AS island
+        FROM (
+            SELECT f.update_id, f.eas_client_id, f.first_seen_at, f.resolved_at,
+                   -- An unresolved fault swallows everything that starts after
+                   -- it, hence infinity rather than NULL.
+                   MAX(COALESCE(f.resolved_at, 'infinity'::timestamptz)) OVER (
+                       PARTITION BY f.update_id, f.eas_client_id
+                       ORDER BY f.first_seen_at
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_end
+            FROM device_update_failures f
+            WHERE f.app_id = $3
+              AND f.update_id = ANY($4::uuid[])
+        ) ordered
+    ) grouped
+    GROUP BY update_id, eas_client_id, island
+)
+SELECT d.update_uuid,
+       d.idx AS bucket_index,
+       SUM(d.adopted)::bigint AS adopted_delta,
+       SUM(d.failing)::bigint AS failing_delta
+FROM (
+    SELECT di.current_update_id AS update_uuid,
+           floor(EXTRACT(EPOCH FROM (
+               GREATEST(
+                   -- No recorded arrival means the device was already there
+                   -- when the column appeared, so it belongs to the first
+                   -- bucket rather than to nothing at all. Dropping those rows
+                   -- put the curve permanently below the adoption count shown
+                   -- beside it.
+                   COALESCE(di.current_update_arrived_at, $1::timestamptz),
+                   $1::timestamptz
+               ) - $1::timestamptz
+           )) / $2::int)::int AS idx,
+           1 AS adopted,
+           0 AS failing
+    FROM device_identity di
+    WHERE di.app_id = $3
+      AND di.current_update_id = ANY($4::uuid[])
+      AND (di.current_update_arrived_at IS NULL
+           OR di.current_update_arrived_at <= $5::timestamptz)
+
+    UNION ALL
+
+    SELECT i.update_id,
+           floor(EXTRACT(EPOCH FROM (
+               GREATEST(i.opened_at, $1::timestamptz) - $1::timestamptz
+           )) / $2::int)::int,
+           0,
+           1
+    FROM failure_islands i
+    WHERE i.opened_at <= $5::timestamptz
+
+    UNION ALL
+
+    -- The other end of each merged fault.
+    SELECT i.update_id,
+           floor(EXTRACT(EPOCH FROM (
+               GREATEST(i.closed_at, $1::timestamptz) - $1::timestamptz
+           )) / $2::int)::int,
+           0,
+           -1
+    FROM failure_islands i
+    WHERE i.closed_at IS NOT NULL
+      AND i.closed_at <= $5::timestamptz
+      -- A resolution stamped before the fault it closes would otherwise emit
+      -- its -1 in an earlier bucket than the +1 and drive the curve negative.
+      AND i.closed_at >= i.opened_at
+) d
+GROUP BY d.update_uuid, d.idx
+ORDER BY d.update_uuid, d.idx
+`
+
+type ListUpdateHealthStateDeltasParams struct {
+	FromTs      pgtype.Timestamptz `json:"from_ts"`
+	StepSeconds int32              `json:"step_seconds"`
+	AppID       pgtype.UUID        `json:"app_id"`
+	UpdateIds   []pgtype.UUID      `json:"update_ids"`
+	ToTs        pgtype.Timestamptz `json:"to_ts"`
+}
+
+type ListUpdateHealthStateDeltasRow struct {
+	UpdateUuid   pgtype.UUID `json:"update_uuid"`
+	BucketIndex  int32       `json:"bucket_index"`
+	AdoptedDelta int64       `json:"adopted_delta"`
+	FailingDelta int64       `json:"failing_delta"`
+}
+
+// Absolute current health for every update the fleet is on. Three kinds of
+// row, and they answer different questions:
+//
+//	current/candidate  the newest checked update of each branch/runtime/
+//	                   platform, and control, the update an active rollout
+//	                   runs against. Their health score is what you watch
+//	                   during a release.
+//	legacy             every other update devices are still running. Its
+//	                   health is settled, but "how many are stuck on the
+//	                   version from three months ago" is a question an OTA
+//	                   operator has to be able to answer, and it can only be
+//	                   answered if the series was recorded while it was true.
+//
+// The legacy arm is bounded by where the fleet actually sits, not by how much
+// has ever been published: an app with a thousand updates has devices on a
+// handful of them. Adoption is counted once for every update in a single
+// grouped pass over (app_id, current_update_id), which is indexed, rather
+// than once per update.
+//
+// The ClickHouse worker samples these rows into one-minute buckets.
+// What PostgreSQL alone can say about an update over time, for deployments
+// with no ClickHouse. It is NOT the same answer as the projected history, and
+// the difference is worth stating precisely because only one of the two series
+// below is honest about the past.
+//
+// Failures are exact. device_update_failures keeps both ends of every fault
+// (first_seen_at, and resolved_at when a runtime issue recovers), so a count at
+// an instant is a real count at that instant, and the curve can fall as well as
+// rise.
+//
+// Arrivals are not, and cannot be. device_identity holds one row per device,
+// overwritten: current_update_arrived_at records when a device MOVED ONTO the
+// update it runs now, never when it left the one before. So the only population reachable here
+// is "devices still on this update today", dated by when each of them arrived.
+// That curve is exact at its right edge and increasingly revisionist the
+// further back it is read, because every device that has since moved away was
+// erased from its own history. It can only ever rise: a rollback does not show
+// as a fall, it shows as a peak that was never there.
+//
+// Deltas rather than a count per bucket, which would have meant a full scan of
+// device_identity per point on the chart. Anything older than the window is
+// folded into bucket zero so the caller's running total starts at what was
+// already there rather than at nothing. The caller holds the window start and
+// the step, so it turns an index back into an instant and carries the running
+// sum itself.
+func (q *Queries) ListUpdateHealthStateDeltas(ctx context.Context, arg ListUpdateHealthStateDeltasParams) ([]ListUpdateHealthStateDeltasRow, error) {
+	rows, err := q.db.Query(ctx, listUpdateHealthStateDeltas,
+		arg.FromTs,
+		arg.StepSeconds,
+		arg.AppID,
+		arg.UpdateIds,
+		arg.ToTs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUpdateHealthStateDeltasRow
+	for rows.Next() {
+		var i ListUpdateHealthStateDeltasRow
+		if err := rows.Scan(
+			&i.UpdateUuid,
+			&i.BucketIndex,
+			&i.AdoptedDelta,
+			&i.FailingDelta,
 		); err != nil {
 			return nil, err
 		}
@@ -3139,48 +4126,6 @@ func (q *Queries) MigrateLegacyUpdate(ctx context.Context, arg MigrateLegacyUpda
 	return err
 }
 
-const oldestDevicesExcluding = `-- name: OldestDevicesExcluding :many
-SELECT eas_client_id, metadata FROM device_identity
-WHERE app_id = $1 AND eas_client_id <> $2
-ORDER BY last_seen_at ASC, eas_client_id ASC
-LIMIT $3::int
-`
-
-type OldestDevicesExcludingParams struct {
-	AppID       pgtype.UUID `json:"app_id"`
-	EasClientID pgtype.UUID `json:"eas_client_id"`
-	Lim         int32       `json:"lim"`
-}
-
-type OldestDevicesExcludingRow struct {
-	EasClientID pgtype.UUID `json:"eas_client_id"`
-	Metadata    []byte      `json:"metadata"`
-}
-
-// The oldest devices of an app by last activity, excluding one (the install
-// being written, which is the most recent and must never be evicted). Feeds
-// the free-tier eviction: their metadata is read so the per-value stats can be
-// decremented before the rows are deleted.
-func (q *Queries) OldestDevicesExcluding(ctx context.Context, arg OldestDevicesExcludingParams) ([]OldestDevicesExcludingRow, error) {
-	rows, err := q.db.Query(ctx, oldestDevicesExcluding, arg.AppID, arg.EasClientID, arg.Lim)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []OldestDevicesExcludingRow
-	for rows.Next() {
-		var i OldestDevicesExcludingRow
-		if err := rows.Scan(&i.EasClientID, &i.Metadata); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const purgeAuditLogEventsBefore = `-- name: PurgeAuditLogEventsBefore :execresult
 DELETE FROM audit_log_events
 WHERE occurred_at < $1
@@ -3204,6 +4149,291 @@ func (q *Queries) PurgeExportedAuditLogEventsBefore(ctx context.Context, occurre
 	return q.db.Exec(ctx, purgeExportedAuditLogEventsBefore, occurredAt)
 }
 
+const recordDeviceRuntimeFailure = `-- name: RecordDeviceRuntimeFailure :exec
+WITH runtime_state AS (
+    INSERT INTO device_update_runtime_state (
+        app_id, eas_client_id, update_id, last_crashed_at
+    )
+    SELECT $1, $2, u.update_uuid, $5
+    FROM updates u
+    JOIN branches b ON b.id = u.branch_id
+    WHERE b.app_id = $1
+      AND u.update_uuid = $3
+      AND u.checked_at IS NOT NULL
+    ON CONFLICT (app_id, eas_client_id, update_id) DO UPDATE SET
+        last_crashed_at = GREATEST(
+            device_update_runtime_state.last_crashed_at,
+            EXCLUDED.last_crashed_at
+        )
+    RETURNING app_id, eas_client_id, update_id,
+              last_started_at, last_crashed_at
+)
+INSERT INTO device_update_failures (
+    app_id, eas_client_id, update_id, failure_type, fatal_error,
+    first_seen_at, last_seen_at
+)
+SELECT app_id, eas_client_id, update_id, 'runtime_issue',
+       $4, $5, $5
+FROM runtime_state
+WHERE last_started_at IS NULL OR last_crashed_at >= last_started_at
+ON CONFLICT (app_id, eas_client_id, update_id, failure_type) DO UPDATE SET
+    last_seen_at = GREATEST(
+        device_update_failures.last_seen_at,
+        EXCLUDED.last_seen_at
+    ),
+    resolved_at = CASE
+        WHEN device_update_failures.resolved_at IS NOT NULL
+         AND EXCLUDED.last_seen_at > device_update_failures.resolved_at
+        THEN NULL
+        ELSE device_update_failures.resolved_at
+    END,
+    fatal_error = CASE
+        WHEN device_update_failures.fatal_error = '' THEN EXCLUDED.fatal_error
+        ELSE device_update_failures.fatal_error
+    END
+`
+
+type RecordDeviceRuntimeFailureParams struct {
+	AppID       pgtype.UUID        `json:"app_id"`
+	EasClientID pgtype.UUID        `json:"eas_client_id"`
+	UpdateUuid  pgtype.UUID        `json:"update_uuid"`
+	FatalError  string             `json:"fatal_error"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+}
+
+// Runtime crash transition. The watermark upsert serializes concurrent
+// startup/crash delivery for this device+update; only the newest source event
+// can change current health.
+// The conflict target pins failure_type to 'runtime_issue', the literal this
+// statement inserts, so the reopen below no longer needs to check the type: it
+// cannot reach a row typed by the manifest writer.
+func (q *Queries) RecordDeviceRuntimeFailure(ctx context.Context, arg RecordDeviceRuntimeFailureParams) error {
+	_, err := q.db.Exec(ctx, recordDeviceRuntimeFailure,
+		arg.AppID,
+		arg.EasClientID,
+		arg.UpdateUuid,
+		arg.FatalError,
+		arg.OccurredAt,
+	)
+	return err
+}
+
+const registerDevice = `-- name: RegisterDevice :execrows
+WITH origin AS (
+    SELECT u.update_uuid,
+           b.name AS branch_name,
+           rv.version AS runtime_version,
+           u.platform,
+           u.publish_group
+    FROM updates u
+    INNER JOIN branches b ON b.id = u.branch_id AND b.app_id = $1
+    LEFT JOIN runtime_versions rv ON rv.id = u.runtime_version_id
+    WHERE u.update_uuid = $11::uuid
+    LIMIT 1
+)
+INSERT INTO device_identity (
+    app_id, eas_client_id, country_code, city, lat, lng, current_update_id,
+    device_model, os_name, os_version, app_version, current_update_observed_at,
+    current_update_arrived_at,
+    branch_name, runtime_version, platform, publish_group
+)
+VALUES (
+    $1, $2, $3, $4, $5,
+    $6, (SELECT update_uuid FROM origin), $7,
+    $8, $9, $10,
+    CASE WHEN $11::uuid IS NULL
+        THEN NULL ELSE $12::timestamptz END,
+    -- A first sighting IS an arrival.
+    CASE WHEN $11::uuid IS NULL
+        THEN NULL ELSE $12::timestamptz END,
+    (SELECT branch_name FROM origin), (SELECT runtime_version FROM origin),
+    (SELECT platform FROM origin), (SELECT publish_group FROM origin)
+)
+ON CONFLICT (app_id, eas_client_id) DO UPDATE SET
+    last_seen_at = CURRENT_TIMESTAMP,
+    current_update_id = CASE WHEN $11::uuid IS NULL
+        THEN device_identity.current_update_id ELSE EXCLUDED.current_update_id END,
+    branch_name = CASE WHEN $11::uuid IS NULL
+        THEN device_identity.branch_name ELSE EXCLUDED.branch_name END,
+    runtime_version = CASE WHEN $11::uuid IS NULL
+        THEN device_identity.runtime_version ELSE EXCLUDED.runtime_version END,
+    platform = CASE WHEN $11::uuid IS NULL
+        THEN device_identity.platform ELSE EXCLUDED.platform END,
+    publish_group = CASE WHEN $11::uuid IS NULL
+        THEN device_identity.publish_group ELSE EXCLUDED.publish_group END,
+    device_model = COALESCE(EXCLUDED.device_model, device_identity.device_model),
+    os_name = COALESCE(EXCLUDED.os_name, device_identity.os_name),
+    os_version = COALESCE(EXCLUDED.os_version, device_identity.os_version),
+    app_version = COALESCE(EXCLUDED.app_version, device_identity.app_version),
+    current_update_observed_at = CASE WHEN $11::uuid IS NULL
+        THEN device_identity.current_update_observed_at
+        ELSE EXCLUDED.current_update_observed_at END,
+    -- Same distinction as TouchDeviceIdentity: the arrival only moves when the
+    -- update does.
+    current_update_arrived_at = CASE
+        WHEN $11::uuid IS NULL
+            THEN device_identity.current_update_arrived_at
+        WHEN device_identity.current_update_id IS DISTINCT FROM EXCLUDED.current_update_id
+            THEN EXCLUDED.current_update_arrived_at
+        -- Same as above: a device merely seen again keeps whatever it has,
+        -- NULL included.
+        ELSE device_identity.current_update_arrived_at
+    END
+WHERE $11::uuid IS NULL
+   OR device_identity.current_update_observed_at IS NULL
+   OR EXCLUDED.current_update_observed_at >= device_identity.current_update_observed_at
+`
+
+type RegisterDeviceParams struct {
+	AppID           pgtype.UUID        `json:"app_id"`
+	EasClientID     pgtype.UUID        `json:"eas_client_id"`
+	CountryCode     *string            `json:"country_code"`
+	City            *string            `json:"city"`
+	Lat             *float64           `json:"lat"`
+	Lng             *float64           `json:"lng"`
+	DeviceModel     *string            `json:"device_model"`
+	OsName          *string            `json:"os_name"`
+	OsVersion       *string            `json:"os_version"`
+	AppVersion      *string            `json:"app_version"`
+	CurrentUpdateID pgtype.UUID        `json:"current_update_id"`
+	ObservedAt      pgtype.Timestamptz `json:"observed_at"`
+}
+
+// Registration upsert for the passive path: the registry is uncapped (the
+// whole fleet is the update-health source of truth). ON CONFLICT absorbs the
+// race with a concurrent registration of the same device.
+// Same rule as TouchDeviceIdentity on the conflict arm: the release columns
+// follow current_update_id, and only when this registration names one.
+// The arms below test the PARAMETER and not EXCLUDED: now that the insert
+// writes the RESOLVED update, EXCLUDED is NULL both when the check-in named no
+// update and when it named one the server does not know, and those two must
+// not behave the same. The first keeps what the row holds, the second blanks
+// it, exactly as TouchDeviceIdentity does.
+// Same staleness guard as TouchDeviceIdentity, on the arm that absorbs the
+// race between two concurrent registrations of the same device.
+func (q *Queries) RegisterDevice(ctx context.Context, arg RegisterDeviceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, registerDevice,
+		arg.AppID,
+		arg.EasClientID,
+		arg.CountryCode,
+		arg.City,
+		arg.Lat,
+		arg.Lng,
+		arg.DeviceModel,
+		arg.OsName,
+		arg.OsVersion,
+		arg.AppVersion,
+		arg.CurrentUpdateID,
+		arg.ObservedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const reopenDeviceUpdateFailures = `-- name: ReopenDeviceUpdateFailures :execrows
+UPDATE device_update_failures failure
+SET resolved_at = NULL
+FROM updates running
+JOIN branches running_branch ON running_branch.id = running.branch_id,
+     updates failed
+WHERE failure.app_id = $1
+  AND failure.eas_client_id = $2
+  AND failure.failure_type = 'update_issue'
+  AND failure.resolved_at IS NOT NULL
+  -- Reported again since it was closed, which is the only evidence that the
+  -- device met the failure a second time rather than merely remembering it.
+  AND failure.last_seen_at > failure.resolved_at
+  AND running_branch.app_id = $1
+  AND running.update_uuid = $3
+  AND running.checked_at IS NOT NULL
+  AND failed.update_uuid = failure.update_id
+  AND failed.branch_id = running.branch_id
+  AND failed.runtime_version_id = running.runtime_version_id
+  AND failed.platform = running.platform
+  -- Strictly BEHIND it: the device rolled back and is stuck again.
+  --
+  -- Not "on it", even though that reads as the symmetric case. Running the very
+  -- update one failed is the evidence the resolution uses to CLOSE the row, and
+  -- owning it here too made the two rules fight over the same pair of columns:
+  -- a device sending both manifest polls and telemetry closed on one and
+  -- re-opened on the other indefinitely, emitting an outbox event each way. The
+  -- resolution settles that case with a timestamp comparison this query cannot
+  -- make, so it keeps it.
+  AND failed.id > running.id
+`
+
+type ReopenDeviceUpdateFailuresParams struct {
+	AppID       pgtype.UUID `json:"app_id"`
+	EasClientID pgtype.UUID `json:"eas_client_id"`
+	UpdateUuid  pgtype.UUID `json:"update_uuid"`
+}
+
+// A rollback that stopped being one. Manifest failures (update_issue) had no
+// resolution path at all: a device reports the update it could not launch, and
+// that row stayed open forever, because the recovery signal the runtime path
+// uses is a successful JS startup and a native launch failure never produces
+// one. An update the whole fleet had long moved past therefore kept every
+// failure it ever collected, and since its live population was zero, its
+// health read 0% for good.
+//
+// Two ways a device stops being stuck, and both are visible on the manifest
+// poll alone, with no telemetry involved.
+//
+// It has moved PAST the update, onto a later one of the same branch, runtime
+// and platform. Ordered on updates.id rather than on a timestamp: two
+// platforms published in the same second would otherwise resolve each other's
+// failures. The direction is what carries the meaning. A rollback lands on an
+// OLDER update, so the failure stays open and the device stays counted as
+// stuck; an upgrade lands on a newer one, so it closes. This holds for BOTH
+// kinds of failure: a device that crashed in JS on an update it has since left
+// behind is no longer failing on it either.
+//
+// Or it is running the very update it failed on, which means that update
+// launched after all. Restricted to update_issue, and the restriction is the
+// whole point: for a runtime failure, running the update IS the failing state,
+// since the device launches it and then crashes in JS. Resolving on that
+// signal would clear every JS crash on the next manifest poll. Those clear
+// through ResolveDeviceRuntimeFailure below, on a successful startup.
+//
+// The consequence is worth stating: faulty devices now means "stuck on this
+// update now" rather than "failed on it once". A bad release stops being
+// visible here once the fleet has moved on, and that history lives in the
+// ClickHouse projection instead, which is the only place that can keep it.
+//
+// The strict comparison on last_seen_at belongs to that second case ONLY, where
+// it settles a genuine ambiguity: the same poll saying "I run this update" and
+// "this update failed" must leave the failure open. There is no such ambiguity
+// when the device has moved past the update, and applying the guard there was
+// a bug that made the whole rule inert. expo-updates keeps listing a failed id
+// in Expo-Recent-Failed-Update-IDs for a while after the fact, so every poll
+// rewrote last_seen_at to the poll instant, which is stamped by the database
+// AFTER the request timestamp the resolution compares against. The comparison
+// was therefore false forever, for exactly the devices the rule exists to
+// clear.
+// The way back. ResolveDeviceUpdateFailures below closes a failure when the
+// device moves onto a later release; this re-opens one when the device is back
+// at or behind the update it had failed, and has reported failing it again
+// since it was closed. Without it, closing was a one-way door: a device that
+// went forward once and later hit the same broken update again stayed counted
+// as healthy for good.
+//
+// Deliberately NOT done in UpsertDeviceUpdateFailure's ON CONFLICT arm, where
+// it would look natural. expo-updates keeps listing a failed id in
+// Expo-Recent-Failed-Update-IDs long after the fact, so every repeat would
+// re-open the row and the resolution running later in the same check-in would
+// close it again: two outbox events per device per debounce window, for a state
+// that never actually changed. Here the direction is known, so a device sitting
+// on a newer release repeating an old id changes nothing.
+func (q *Queries) ReopenDeviceUpdateFailures(ctx context.Context, arg ReopenDeviceUpdateFailuresParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reopenDeviceUpdateFailures, arg.AppID, arg.EasClientID, arg.UpdateUuid)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const repointChannelToRolloutBranch = `-- name: RepointChannelToRolloutBranch :execrows
 UPDATE channels
 SET branch_id = (
@@ -3223,6 +4453,119 @@ type RepointChannelToRolloutBranchParams struct {
 // rollout guard because it is a distinct statement.
 func (q *Queries) RepointChannelToRolloutBranch(ctx context.Context, arg RepointChannelToRolloutBranchParams) (int64, error) {
 	result, err := q.db.Exec(ctx, repointChannelToRolloutBranch, arg.AppID, arg.Name)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resolveDeviceRuntimeFailure = `-- name: ResolveDeviceRuntimeFailure :execrows
+WITH runtime_state AS (
+    INSERT INTO device_update_runtime_state (
+        app_id, eas_client_id, update_id, last_started_at
+    )
+    SELECT $1, $2, u.update_uuid, $4
+    FROM updates u
+    JOIN branches b ON b.id = u.branch_id
+    WHERE b.app_id = $1
+      AND u.update_uuid = $3
+      AND u.checked_at IS NOT NULL
+    ON CONFLICT (app_id, eas_client_id, update_id) DO UPDATE SET
+        last_started_at = GREATEST(
+            device_update_runtime_state.last_started_at,
+            EXCLUDED.last_started_at
+        )
+    RETURNING app_id, eas_client_id, update_id, last_started_at
+)
+UPDATE device_update_failures failure
+SET resolved_at = runtime_state.last_started_at
+FROM runtime_state
+WHERE failure.app_id = runtime_state.app_id
+  AND failure.eas_client_id = runtime_state.eas_client_id
+  AND failure.update_id = runtime_state.update_id
+  AND failure.failure_type = 'runtime_issue'
+  AND failure.resolved_at IS NULL
+  AND failure.last_seen_at < runtime_state.last_started_at
+`
+
+type ResolveDeviceRuntimeFailureParams struct {
+	AppID       pgtype.UUID        `json:"app_id"`
+	EasClientID pgtype.UUID        `json:"eas_client_id"`
+	UpdateUuid  pgtype.UUID        `json:"update_uuid"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+}
+
+// Successful JS startup. Recording the watermark even without an existing
+// failure prevents a delayed older crash from regressing the device. Strict
+// comparison makes a crash win timestamp ties.
+func (q *Queries) ResolveDeviceRuntimeFailure(ctx context.Context, arg ResolveDeviceRuntimeFailureParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resolveDeviceRuntimeFailure,
+		arg.AppID,
+		arg.EasClientID,
+		arg.UpdateUuid,
+		arg.OccurredAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resolveDeviceUpdateFailures = `-- name: ResolveDeviceUpdateFailures :execrows
+UPDATE device_update_failures failure
+SET resolved_at = GREATEST($4, failure.first_seen_at)
+FROM updates running
+JOIN branches running_branch ON running_branch.id = running.branch_id,
+     updates failed
+WHERE failure.app_id = $1
+  AND failure.eas_client_id = $2
+  AND failure.resolved_at IS NULL
+  AND running_branch.app_id = $1
+  AND running.update_uuid = $3
+  AND running.checked_at IS NOT NULL
+  AND failed.update_uuid = failure.update_id
+  AND (
+      (failed.branch_id = running.branch_id
+       AND failed.runtime_version_id = running.runtime_version_id
+       AND failed.platform = running.platform
+       AND failed.id < running.id)
+      -- Compared on the uuid, not on the id. updates.id is
+      -- milliseconds*10 + a platform digit and the primary key is
+      -- (branch_id, id), so ids are unique per BRANCH: two branches of one app
+      -- published in the same millisecond for the same platform, which is what
+      -- a CI job releasing main and staging together does, carry the same id.
+      -- Matching on it would have closed a failure on one branch's update
+      -- because the device runs the other's. The arm above is safe from this
+      -- because it pins the whole lineage.
+      OR (failed.update_uuid = running.update_uuid
+          AND failure.failure_type = 'update_issue'
+          AND failure.last_seen_at < $4)
+     )
+`
+
+type ResolveDeviceUpdateFailuresParams struct {
+	AppID       pgtype.UUID        `json:"app_id"`
+	EasClientID pgtype.UUID        `json:"eas_client_id"`
+	UpdateUuid  pgtype.UUID        `json:"update_uuid"`
+	ObservedAt  pgtype.Timestamptz `json:"observed_at"`
+}
+
+// Never before the fault it closes. observed_at is not always the instant the
+// request arrived: on the telemetry path it is the newest record of the batch,
+// which a device flushing a backlog can date days ago. A resolution stamped
+// before its own first_seen_at emits its -1 in an earlier bucket than the +1 on
+// the fallback chart, and reaches ClickHouse as a 'recovered' older than the
+// 'failure' it answers.
+// The join to the failed update lives in the WHERE, not in an ON clause: the
+// row being updated is not part of the FROM list, so a JOIN condition cannot
+// reference it and the predicate would silently match nothing.
+func (q *Queries) ResolveDeviceUpdateFailures(ctx context.Context, arg ResolveDeviceUpdateFailuresParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resolveDeviceUpdateFailures,
+		arg.AppID,
+		arg.EasClientID,
+		arg.UpdateUuid,
+		arg.ObservedAt,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -3426,6 +4769,139 @@ func (q *Queries) TopIdentityValues(ctx context.Context, arg TopIdentityValuesPa
 	return items, nil
 }
 
+const touchDeviceIdentity = `-- name: TouchDeviceIdentity :execrows
+WITH origin AS (
+    SELECT u.update_uuid,
+           b.name AS branch_name,
+           rv.version AS runtime_version,
+           u.platform,
+           u.publish_group
+    FROM updates u
+    INNER JOIN branches b ON b.id = u.branch_id AND b.app_id = $1
+    LEFT JOIN runtime_versions rv ON rv.id = u.runtime_version_id
+    WHERE u.update_uuid = $7::uuid
+    LIMIT 1
+)
+UPDATE device_identity SET
+    country_code = COALESCE($3, device_identity.country_code),
+    city = COALESCE($4, device_identity.city),
+    lat = COALESCE($5, device_identity.lat),
+    lng = COALESCE($6, device_identity.lng),
+    -- The RESOLVED update, never the id as it arrived. The header is
+    -- unauthenticated, so a device can name an update that does not exist or
+    -- belongs to another app, and writing it raw put a value the server never
+    -- published into an analytical column. Worse, the outbox trigger fires on
+    -- every change of this column, so alternating invented ids minted one
+    -- permanent adoption event per request. Unresolved now lands NULL, which
+    -- the trigger ignores (it only enqueues a non-NULL update).
+    --
+    -- The cost is that a device back on its embedded bundle reports the
+    -- bundle's own id, which matches no row, so it reads as "on no known
+    -- update" rather than naming the bundle. Publishing an update to a fresh
+    -- app is what fills this in, and the docs say so.
+    current_update_id = CASE WHEN $7::uuid IS NULL
+        THEN device_identity.current_update_id ELSE (SELECT o.update_uuid FROM origin o) END,
+    -- Rewritten on the same rule, so the release columns can never describe an
+    -- update the id column does not hold: a manifest poll carrying no header
+    -- keeps what the last one established.
+    branch_name = CASE WHEN $7::uuid IS NULL
+        THEN device_identity.branch_name ELSE (SELECT o.branch_name FROM origin o) END,
+    runtime_version = CASE WHEN $7::uuid IS NULL
+        THEN device_identity.runtime_version ELSE (SELECT o.runtime_version FROM origin o) END,
+    platform = CASE WHEN $7::uuid IS NULL
+        THEN device_identity.platform ELSE (SELECT o.platform FROM origin o) END,
+    publish_group = CASE WHEN $7::uuid IS NULL
+        THEN device_identity.publish_group ELSE (SELECT o.publish_group FROM origin o) END,
+    -- Only telemetry knows the hardware; a manifest poll passes NULL here and
+    -- must never blank what a previous batch established.
+    device_model = COALESCE($8, device_identity.device_model),
+    os_name = COALESCE($9, device_identity.os_name),
+    os_version = COALESCE($10, device_identity.os_version),
+    app_version = COALESCE($11, device_identity.app_version),
+    current_update_observed_at = CASE WHEN $7::uuid IS NULL
+        THEN device_identity.current_update_observed_at ELSE $12::timestamptz END,
+    -- Moved onto, not heard from. The watermark above advances on every poll,
+    -- because that is what makes it able to order racing observations; this one
+    -- stands still for as long as the device stays where it is, which is what
+    -- lets a chart date an adoption.
+    current_update_arrived_at = CASE
+        WHEN $7::uuid IS NULL
+            THEN device_identity.current_update_arrived_at
+        WHEN device_identity.current_update_id IS DISTINCT FROM (SELECT o.update_uuid FROM origin o)
+            THEN $12::timestamptz
+        -- Unchanged means unchanged, including when nothing is recorded yet.
+        -- Filling a NULL here with the current instant would have dated the
+        -- whole pre-existing fleet at the deploy that introduced the column,
+        -- within one debounce window, and drawn a vertical cliff there on any
+        -- window spanning it. It buys nothing either way: a NULL and a stamp
+        -- read identically on every window that starts after the deploy, since
+        -- both fold into the first bucket, and on the windows where they differ
+        -- the NULL is the honest one.
+        ELSE device_identity.current_update_arrived_at
+    END,
+    last_seen_at = CURRENT_TIMESTAMP
+WHERE device_identity.app_id = $1 AND device_identity.eas_client_id = $2
+  -- An observation older than the one on file changes nothing, not even
+  -- last_seen_at: a device that took an update while offline then flushes the
+  -- telemetry it recorded BEFORE the switch races the manifest poll announcing
+  -- the new one, and whichever lands last used to win. The guard belongs in
+  -- the WHERE and not in each CASE above: PostgreSQL re-evaluates it against
+  -- the freshly written row when a concurrent UPDATE releases the row lock,
+  -- while a CTE or a self-join would still be reading the snapshot both racers
+  -- started from and would let them both through.
+  --
+  -- A check-in naming no update passes unconditionally: it says nothing about
+  -- which update runs, so it has nothing to be stale about.
+  AND ($7::uuid IS NULL
+       OR device_identity.current_update_observed_at IS NULL
+       OR $12::timestamptz >= device_identity.current_update_observed_at)
+`
+
+type TouchDeviceIdentityParams struct {
+	AppID           pgtype.UUID        `json:"app_id"`
+	EasClientID     pgtype.UUID        `json:"eas_client_id"`
+	CountryCode     *string            `json:"country_code"`
+	City            *string            `json:"city"`
+	Lat             *float64           `json:"lat"`
+	Lng             *float64           `json:"lng"`
+	CurrentUpdateID pgtype.UUID        `json:"current_update_id"`
+	DeviceModel     *string            `json:"device_model"`
+	OsName          *string            `json:"os_name"`
+	OsVersion       *string            `json:"os_version"`
+	AppVersion      *string            `json:"app_version"`
+	ObservedAt      pgtype.Timestamptz `json:"observed_at"`
+}
+
+// Passive-contact bump (manifest poll, telemetry batch): refresh last_seen and
+// opportunistically enrich geo, never touching metadata. 1 row = known device;
+// 0 = brand new, the caller registers it.
+//
+// The release dimensions are resolved here rather than joined at read time
+// (see 20260726120000_device_release_columns.sql). The CTE is the app-scoping
+// guard the reads used to carry as an EXISTS: it joins branches on the caller's
+// app id, so an update belonging to another app resolves to no row and the
+// columns land NULL, exactly as the old LEFT JOIN produced.
+func (q *Queries) TouchDeviceIdentity(ctx context.Context, arg TouchDeviceIdentityParams) (int64, error) {
+	result, err := q.db.Exec(ctx, touchDeviceIdentity,
+		arg.AppID,
+		arg.EasClientID,
+		arg.CountryCode,
+		arg.City,
+		arg.Lat,
+		arg.Lng,
+		arg.CurrentUpdateID,
+		arg.DeviceModel,
+		arg.OsName,
+		arg.OsVersion,
+		arg.AppVersion,
+		arg.ObservedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const touchSSOIdentityLastLogin = `-- name: TouchSSOIdentityLastLogin :exec
 UPDATE sso_identities
 SET last_login_at = CURRENT_TIMESTAMP
@@ -3553,7 +5029,7 @@ UPDATE device_identity SET
     lng = COALESCE($7, lng),
     last_seen_at = CURRENT_TIMESTAMP
 WHERE app_id = $1 AND eas_client_id = $2
-RETURNING app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at
+RETURNING app_id, eas_client_id, metadata, country_code, city, lat, lng, first_seen_at, last_seen_at, current_update_id, device_model, os_name, os_version, branch_name, runtime_version, platform, publish_group, app_version, current_update_observed_at, current_update_arrived_at
 `
 
 type UpdateDeviceIdentityParams struct {
@@ -3566,6 +5042,9 @@ type UpdateDeviceIdentityParams struct {
 	Lng         *float64    `json:"lng"`
 }
 
+// The merge write of an identity op. Same COALESCE rule as TouchDeviceIdentity:
+// a NULL geo argument means "this operation did not resolve one", and must
+// leave whatever an earlier batch established rather than blank it.
 func (q *Queries) UpdateDeviceIdentity(ctx context.Context, arg UpdateDeviceIdentityParams) (DeviceIdentity, error) {
 	row := q.db.QueryRow(ctx, updateDeviceIdentity,
 		arg.AppID,
@@ -3587,8 +5066,92 @@ func (q *Queries) UpdateDeviceIdentity(ctx context.Context, arg UpdateDeviceIden
 		&i.Lng,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.CurrentUpdateID,
+		&i.DeviceModel,
+		&i.OsName,
+		&i.OsVersion,
+		&i.BranchName,
+		&i.RuntimeVersion,
+		&i.Platform,
+		&i.PublishGroup,
+		&i.AppVersion,
+		&i.CurrentUpdateObservedAt,
+		&i.CurrentUpdateArrivedAt,
 	)
 	return i, err
+}
+
+const updateFailureBreakdownByIDs = `-- name: UpdateFailureBreakdownByIDs :many
+SELECT f.update_id AS update_uuid,
+       COUNT(DISTINCT f.eas_client_id) AS failed_devices,
+       COUNT(DISTINCT f.eas_client_id) FILTER (WHERE f.failure_type = 'update_issue') AS update_devices,
+       COUNT(DISTINCT f.eas_client_id) FILTER (WHERE f.failure_type = 'runtime_issue') AS runtime_devices,
+       COUNT(DISTINCT d.eas_client_id) AS still_on_update
+FROM device_update_failures f
+LEFT JOIN device_identity d
+    ON d.app_id = f.app_id
+   AND d.eas_client_id = f.eas_client_id
+   AND d.current_update_id = f.update_id
+WHERE f.app_id = $1
+  AND f.update_id = ANY($2::uuid[])
+  AND f.resolved_at IS NULL
+GROUP BY f.update_id
+`
+
+type UpdateFailureBreakdownByIDsParams struct {
+	AppID     pgtype.UUID   `json:"app_id"`
+	UpdateIds []pgtype.UUID `json:"update_ids"`
+}
+
+type UpdateFailureBreakdownByIDsRow struct {
+	UpdateUuid     pgtype.UUID `json:"update_uuid"`
+	FailedDevices  int64       `json:"failed_devices"`
+	UpdateDevices  int64       `json:"update_devices"`
+	RuntimeDevices int64       `json:"runtime_devices"`
+	StillOnUpdate  int64       `json:"still_on_update"`
+}
+
+// Batch failure breakdown for a set of updates. All-time per update: an
+// update's failures belong to its rollout window by construction (update ids
+// are never reused), and the health score is only shown for the active one.
+// still_on_update counts failed devices whose CURRENT update is still the
+// failed one (runtime_issue devices that did not move on): the overlap
+// between the failure set and the current-device cohort, which the health
+// math needs so those devices are neither double-counted as attempts nor
+// kept in the healthy numerator. A failed device that has since moved to
+// another update (or rolled back: every update_issue) leaves the overlap by
+// construction, so the join self-corrects when a device changes update.
+// Every count is DISTINCT on the device, and the two breakdowns are counted
+// independently rather than one being derived from the other. A device can hold
+// both a launch rollback and a runtime crash for the same update, which is two
+// rows and one device: counting rows would inflate the totals, and deriving
+// update_devices as failed_devices - runtime_devices would silently drop that
+// device's rollback. failed_devices is therefore the size of the failure SET
+// and may be smaller than update_devices + runtime_devices.
+func (q *Queries) UpdateFailureBreakdownByIDs(ctx context.Context, arg UpdateFailureBreakdownByIDsParams) ([]UpdateFailureBreakdownByIDsRow, error) {
+	rows, err := q.db.Query(ctx, updateFailureBreakdownByIDs, arg.AppID, arg.UpdateIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UpdateFailureBreakdownByIDsRow
+	for rows.Next() {
+		var i UpdateFailureBreakdownByIDsRow
+		if err := rows.Scan(
+			&i.UpdateUuid,
+			&i.FailedDevices,
+			&i.UpdateDevices,
+			&i.RuntimeDevices,
+			&i.StillOnUpdate,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateRole = `-- name: UpdateRole :execresult
@@ -3669,6 +5232,56 @@ type UpdateUserPasswordByIDParams struct {
 
 func (q *Queries) UpdateUserPasswordByID(ctx context.Context, arg UpdateUserPasswordByIDParams) (pgconn.CommandTag, error) {
 	return q.db.Exec(ctx, updateUserPasswordByID, arg.ID, arg.PasswordHash)
+}
+
+const upsertDeviceUpdateFailure = `-- name: UpsertDeviceUpdateFailure :exec
+INSERT INTO device_update_failures (
+    app_id, eas_client_id, update_id, failure_type, fatal_error,
+    first_seen_at, last_seen_at
+)
+SELECT $1, $2, u.update_uuid, $4, $5,
+       $6, $6
+FROM updates u
+JOIN branches b ON b.id = u.branch_id
+WHERE b.app_id = $1
+  AND u.update_uuid = $3
+  AND u.checked_at IS NOT NULL
+ON CONFLICT (app_id, eas_client_id, update_id, failure_type) DO UPDATE SET
+    last_seen_at = GREATEST(
+        device_update_failures.last_seen_at,
+        EXCLUDED.last_seen_at
+    ),
+    fatal_error = CASE
+        WHEN device_update_failures.fatal_error = '' THEN EXCLUDED.fatal_error
+        ELSE device_update_failures.fatal_error
+    END
+`
+
+type UpsertDeviceUpdateFailureParams struct {
+	AppID       pgtype.UUID        `json:"app_id"`
+	EasClientID pgtype.UUID        `json:"eas_client_id"`
+	UpdateUuid  pgtype.UUID        `json:"update_uuid"`
+	FailureType string             `json:"failure_type"`
+	FatalError  string             `json:"fatal_error"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+}
+
+// Records a manifest/native failure at server receipt time. fatal_error stays
+// capture-once.
+//
+// The conflict target carries failure_type (20260726140000_failure_type_in_key.sql):
+// a runtime crash on the same pair is a different row, so a launch rollback can
+// no longer land on top of one and inherit its type.
+func (q *Queries) UpsertDeviceUpdateFailure(ctx context.Context, arg UpsertDeviceUpdateFailureParams) error {
+	_, err := q.db.Exec(ctx, upsertDeviceUpdateFailure,
+		arg.AppID,
+		arg.EasClientID,
+		arg.UpdateUuid,
+		arg.FailureType,
+		arg.FatalError,
+		arg.OccurredAt,
+	)
+	return err
 }
 
 const upsertEnterpriseLicense = `-- name: UpsertEnterpriseLicense :one

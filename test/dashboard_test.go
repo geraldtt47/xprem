@@ -176,7 +176,7 @@ func TestSettings(t *testing.T) {
 	responseBody = strings.ReplaceAll(responseBody, projectRoot+"/keys/public-key-test.pem", "{PROJECT_ROOT}/test/keys/public-key-test.pem")
 	responseBody = strings.ReplaceAll(responseBody, projectRoot+"/keys/private-key-test.pem", "{PROJECT_ROOT}/test/keys/private-key-test.pem")
 
-	expectedSnapshot := `{"BASE_URL":"http://localhost:3000","CONTROL_PLANE_ENABLED":false,"CACHE_MODE":"","REDIS_HOST":"","REDIS_PORT":"","REDIS_SENTINEL_ADDRS":"","REDIS_SENTINEL_MASTER_NAME":"","STORAGE_MODE":"local","S3_BUCKET_NAME":"","CDN_BASE_URL":"","GCS_BUCKET_NAME":"","AZURE_BLOB_CONTAINER_NAME":"","AZURE_STORAGE_ACCOUNT_NAME":"","LOCAL_BUCKET_BASE_PATH":"{PROJECT_ROOT}/test/test-updates","AWS_REGION":"eu-west-3","AWS_BASE_ENDPOINT":"","AWS_S3_FORCE_PATH_STYLE":"","AWS_ACCESS_KEY_ID":"***","CLOUDFRONT_DOMAIN":"","CLOUDFRONT_KEY_PAIR_ID":"***","PRIVATE_CLOUDFRONT_KEY_B64":"***","AWSSM_CLOUDFRONT_PRIVATE_KEY_SECRET_ID":"","PRIVATE_CLOUDFRONT_KEY_PATH":"","PROMETHEUS_ENABLED":"","CDN_TYPE":"","EXPO_ACCOUNT_USERNAME":"","SSO_ENABLED":false,"APPS":[{"id":"test-app-id"}]}`
+	expectedSnapshot := `{"BASE_URL":"http://localhost:3000","SERVER_VERSION":"development","CONTROL_PLANE_ENABLED":false,"CACHE_MODE":"","REDIS_HOST":"","REDIS_PORT":"","REDIS_SENTINEL_ADDRS":"","REDIS_SENTINEL_MASTER_NAME":"","STORAGE_MODE":"local","S3_BUCKET_NAME":"","CDN_BASE_URL":"","GCS_BUCKET_NAME":"","AZURE_BLOB_CONTAINER_NAME":"","AZURE_STORAGE_ACCOUNT_NAME":"","LOCAL_BUCKET_BASE_PATH":"{PROJECT_ROOT}/test/test-updates","AWS_REGION":"eu-west-3","AWS_BASE_ENDPOINT":"","AWS_S3_FORCE_PATH_STYLE":"","AWS_ACCESS_KEY_ID":"***","CLOUDFRONT_DOMAIN":"","CLOUDFRONT_KEY_PAIR_ID":"***","PRIVATE_CLOUDFRONT_KEY_B64":"***","AWSSM_CLOUDFRONT_PRIVATE_KEY_SECRET_ID":"","PRIVATE_CLOUDFRONT_KEY_PATH":"","PROMETHEUS_ENABLED":"","CDN_TYPE":"","EXPO_ACCOUNT_USERNAME":"","SSO_ENABLED":false,"APPS":[{"id":"test-app-id"}]}`
 
 	assert.Equal(t, expectedSnapshot, responseBody)
 }
@@ -411,6 +411,11 @@ func TestDashboardUseExpoAuthCrossAppAttackRejected(t *testing.T) {
 // Use-Cli-Auth happy path: caller's Expo token resolves to the same username
 // as the app's EXPO_ACCESS_TOKEN (ValidateExpoAuth's match check) so the
 // middleware lets the request through to the handler.
+//
+// On runtimeVersions rather than on branches, because the route has to be one
+// the CLI is allowed to reach: only the two routes eoas calls before publishing
+// declare AnyViewerOrToken, everything else in routes_app.go refuses a
+// publishing credential outright.
 func TestDashboardUseExpoAuthHappyPath(t *testing.T) {
 	teardown := setup(t)
 	defer teardown()
@@ -436,7 +441,7 @@ func TestDashboardUseExpoAuthHappyPath(t *testing.T) {
 
 	router := infrastructure.NewRouter(testContainer())
 	respRec := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/api/apps/test-app-id/branches", nil)
+	req, _ := http.NewRequest("GET", "/api/apps/test-app-id/branch/branch-1/runtimeVersions", nil)
 	req.Header.Set("Use-Cli-Auth", "true")
 	req.Header.Set("Authorization", "Bearer expo_test_token")
 	router.ServeHTTP(respRec, req)

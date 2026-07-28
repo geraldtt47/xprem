@@ -1,28 +1,88 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"expo-open-ota/config"
+	"expo-open-ota/internal/helpers"
 	"expo-open-ota/internal/services"
 	"expo-open-ota/internal/types"
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 )
 
+// DeviceCheckIn is everything one manifest poll tells the device registry:
+// who polled, from where, what it currently runs, and which updates crashed
+// on it. The seam's vocabulary type, MIT-side on purpose (the leaf-vocabulary
+// pattern): the wired EE recorder consumes it without the handler importing
+// any EE package.
+type DeviceCheckIn struct {
+	AppID       string
+	EASClientID string
+	RemoteIP    string
+	// CurrentUpdateID is the update the device is RUNNING (the launched
+	// update: one that crashed at launch never appears here). A device on the
+	// embedded bundle reports the embedded update's OWN id, which no updates
+	// table row matches; absent only on clients that sent no header.
+	CurrentUpdateID string
+	// FailedUpdateIDsRaw is the Expo-Recent-Failed-Update-IDs header verbatim
+	// (a structured-field list of quoted UUIDs); parsing belongs to the
+	// consumer.
+	FailedUpdateIDsRaw string
+	// FatalError is the Expo-Fatal-Error header: the crash detail, sent by
+	// the client exactly once, on the first poll after the crash.
+	FatalError string
+	// Rejected marks a poll the server answered with an error. Such a poll is
+	// no evidence that a device exists and must leave nothing durable behind,
+	// so the recorder keeps only the crash detail, in memory, to re-attach to
+	// the next poll that does resolve. Only set on a poll carrying one: every
+	// other signal a check-in holds survives on its own (the failed-id header
+	// is sticky, the device re-registers on its next poll), while the crash
+	// detail is sent once and is gone if this request drops it.
+	Rejected bool
+	// Hardware and OS of the device, spelled as expo-device spells them, plus
+	// the store version of the binary. Telemetry-only: the manifest headers
+	// carry nothing of the sort, so these are empty on every poll and empty
+	// always means "not reported", never "changed to empty".
+	DeviceModel string
+	OSName      string
+	OSVersion   string
+	AppVersion  string
+	// ObservedAt is when the device was running CurrentUpdateID. Zero means
+	// "as this arrives", which is what a manifest poll means: it answers the
+	// device live. Telemetry sets it to the newest record of the batch, which
+	// may be much older, and that is the difference the registry needs to stop
+	// a late backlog from overwriting fresher news.
+	ObservedAt time.Time
+}
+
 type ExpoProtocolHandler struct {
 	protocolService *services.ExpoProtocolService
+	// onDeviceCheckIn, when wired, registers the polling device in the universal
+	// device registry (the Observe feature's). A method-value seam like the
+	// audit recorder: the composition root wires it when Observe is enabled,
+	// and it must never block or fail the manifest path (the wired side runs
+	// its registry write in the background).
+	onDeviceCheckIn func(ctx context.Context, checkIn DeviceCheckIn)
 }
 
 func NewExpoProtocolHandler(ps *services.ExpoProtocolService) *ExpoProtocolHandler {
 	return &ExpoProtocolHandler{protocolService: ps}
 }
 
+// SetOnDeviceCheckIn wires the device check-in recorder; nil (never called) keeps
+// manifest polls side-effect free.
+func (h *ExpoProtocolHandler) SetOnDeviceCheckIn(fn func(ctx context.Context, checkIn DeviceCheckIn)) {
+	h.onDeviceCheckIn = fn
+}
+
 // resolveAppID returns the app a manifest or asset request targets. The
 // expo-app-id header wins when present. When it is absent the caller is a v1
-// client that cannot send it, so we fall back to the deploy's legacy app —
+// client that cannot send it, so we fall back to the deploy's legacy app:
 // see config.LegacyFallbackAppId, which returns "" when there is none and
 // leaves the request to be rejected.
 func resolveAppID(r *http.Request) string {
@@ -30,6 +90,25 @@ func resolveAppID(r *http.Request) string {
 		return appId
 	}
 	return config.LegacyFallbackAppId()
+}
+
+// reportRejectedCrash hands the one-shot crash detail of a refused poll to the
+// registry seam, and only that: no remote address, so nothing resolves a place
+// for a device we are not registering. A poll carrying no crash detail is not
+// reported at all, which keeps a refused request exactly as free of side
+// effects as it was. The caller decides WHEN to reach here, and only does so
+// for a transient failure: there is nothing to hold a detail for when the
+// answer is that the app does not exist.
+func (h *ExpoProtocolHandler) reportRejectedCrash(r *http.Request, appId string, params services.ManifestRequestParams) {
+	if h.onDeviceCheckIn == nil || params.ClientID == "" || params.ExpoFatalError == "" {
+		return
+	}
+	h.onDeviceCheckIn(r.Context(), DeviceCheckIn{
+		AppID:       appId,
+		EASClientID: params.ClientID,
+		FatalError:  params.ExpoFatalError,
+		Rejected:    true,
+	})
 }
 
 func (h *ExpoProtocolHandler) HandleManifest(w http.ResponseWriter, r *http.Request) {
@@ -92,12 +171,50 @@ func (h *ExpoProtocolHandler) HandleManifest(w http.ResponseWriter, r *http.Requ
 	result, err := h.protocolService.ResolveManifestBundle(r.Context(), params)
 	if err != nil {
 		var svcErr *services.ExpoProtocolError
+		status := http.StatusInternalServerError
+		message := "Internal operational error"
 		if errors.As(err, &svcErr) {
-			http.Error(w, svcErr.Message, svcErr.StatusCode)
-			return
+			status, message = svcErr.StatusCode, svcErr.Message
 		}
-		http.Error(w, "Internal operational error", http.StatusInternalServerError)
+		// The crash detail is the one thing this poll carries that no later
+		// poll can, so a resolution that failed TRANSIENTLY still hands it
+		// over: the recorder holds it in memory and re-attaches it to the next
+		// poll that resolves, writing nothing durable now.
+		//
+		// Only transiently. A 4xx says the app or the channel does not exist,
+		// and that answer will not change on its own, so there is no later poll
+		// to re-attach anything to. Stashing there would let an unknown app id
+		// put an entry in the cache for an hour, once per request, which is a
+		// growth path opened by the very mechanism meant to avoid writing.
+		if status >= http.StatusInternalServerError {
+			h.reportRejectedCrash(r, appId, params)
+		}
+		http.Error(w, message, status)
 		return
+	}
+
+	// A poll becomes a device check-in only once it has resolved: a request we
+	// answer with an error is not evidence that a device exists, and the
+	// registry is a durable table reachable from an unauthenticated endpoint.
+	// Resolving first means an unknown app id or a channel that maps to no
+	// branch is rejected without leaving a row behind. A resolution that found
+	// no update still checks in: the app, the channel and the branch were all
+	// real, and a device out of a rollout bucket or ahead of every published
+	// update is as alive as any other. The check-in carries the update-health
+	// signals the same headers already delivered.
+	if h.onDeviceCheckIn != nil && params.ClientID != "" {
+		remoteIP := ""
+		if clientIP := helpers.ClientIP(r); clientIP.IsValid() {
+			remoteIP = clientIP.String()
+		}
+		h.onDeviceCheckIn(r.Context(), DeviceCheckIn{
+			AppID:              appId,
+			EASClientID:        params.ClientID,
+			RemoteIP:           remoteIP,
+			CurrentUpdateID:    params.CurrentUpdateID,
+			FailedUpdateIDsRaw: params.RecentFailedUpdateIDs,
+			FatalError:         params.ExpoFatalError,
+		})
 	}
 
 	if result.Update == nil {

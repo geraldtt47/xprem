@@ -10,6 +10,7 @@ import (
 	"errors"
 	"expo-open-ota/internal/handlers"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,8 +43,15 @@ func (h *IdentityHandler) requireService(w http.ResponseWriter) (*Service, bool)
 
 func renderIdentityServiceError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrRequiresValidLicense):
+		handlers.RenderError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, ErrTooManySchemaKeys):
 		handlers.RenderError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrTooManyCombinations):
+		// The caller asked for more attribute combinations than the
+		// containment filter can express. That is a bad request, not a server
+		// fault, however deep in the store it surfaces.
+		handlers.RenderError(w, http.StatusBadRequest, err.Error())
 	default:
 		handlers.RenderError(w, http.StatusInternalServerError, "An internal error occurred.")
 	}
@@ -68,20 +76,43 @@ type deviceResponse struct {
 	City        *string        `json:"city,omitempty"`
 	Lat         *float64       `json:"lat,omitempty"`
 	Lng         *float64       `json:"lng,omitempty"`
-	FirstSeenAt string         `json:"firstSeenAt"`
-	LastSeenAt  string         `json:"lastSeenAt"`
+	DeviceModel *string        `json:"deviceModel,omitempty"`
+	OsName      *string        `json:"osName,omitempty"`
+	OsVersion   *string        `json:"osVersion,omitempty"`
+	// The update the device runs, and what that update belongs to. Absent
+	// when it is the embedded bundle or an update this server never published.
+	CurrentUpdateId *string `json:"currentUpdateId,omitempty"`
+	Branch          *string `json:"branch,omitempty"`
+	RuntimeVersion  *string `json:"runtimeVersion,omitempty"`
+	Platform        *string `json:"platform,omitempty"`
+	FirstSeenAt     string  `json:"firstSeenAt"`
+	LastSeenAt      string  `json:"lastSeenAt"`
 }
 
 func deviceResponseFrom(d Device) deviceResponse {
+	// A device with no attributes yet carries a nil map, which marshals to
+	// `null` rather than `{}`. Callers iterate this field; hand them the empty
+	// object the field name promises.
+	metadata := d.Metadata
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
 	return deviceResponse{
-		EasClientId: d.EASClientID,
-		Metadata:    d.Metadata,
-		CountryCode: d.CountryCode,
-		City:        d.City,
-		Lat:         d.Lat,
-		Lng:         d.Lng,
-		FirstSeenAt: d.FirstSeenAt.UTC().Format(time.RFC3339),
-		LastSeenAt:  d.LastSeenAt.UTC().Format(time.RFC3339),
+		EasClientId:     d.EASClientID,
+		Metadata:        metadata,
+		CountryCode:     d.CountryCode,
+		City:            d.City,
+		Lat:             d.Lat,
+		Lng:             d.Lng,
+		DeviceModel:     d.DeviceModel,
+		OsName:          d.OSName,
+		OsVersion:       d.OSVersion,
+		CurrentUpdateId: d.CurrentUpdateID,
+		Branch:          d.Branch,
+		RuntimeVersion:  d.RuntimeVersion,
+		Platform:        d.Platform,
+		FirstSeenAt:     d.FirstSeenAt.UTC().Format(time.RFC3339),
+		LastSeenAt:      d.LastSeenAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -186,6 +217,85 @@ func (h *IdentityHandler) SearchValuesHandler(w http.ResponseWriter, r *http.Req
 
 // --- Device inventory ---
 
+// parseDeviceQuery reads the filter parameters the registry can honor, shared
+// by the inventory page and the online count so the two never diverge on what
+// they accept. It renders the 400 itself and reports false when the request is
+// not answerable.
+func parseDeviceQuery(w http.ResponseWriter, r *http.Request, service *Service, appID string) (DeviceQuery, bool) {
+	query := r.URL.Query()
+
+	// Repeated parameters, never a separator: a hardware identifier carries a
+	// comma of its own ("iPhone18,2"). Capped per parameter: each list becomes
+	// a text[] in an `= ANY(...)`, and a request line can hold tens of
+	// thousands of repetitions of the same key.
+	tooMany := false
+	values := func(name string) []string {
+		out := make([]string, 0, len(query[name]))
+		for _, raw := range query[name] {
+			if trimmed := strings.TrimSpace(raw); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		if len(out) > maxDeviceFilterValues {
+			tooMany = true
+			return nil
+		}
+		return out
+	}
+	deviceQuery := DeviceQuery{
+		EASClientIDs:     values("easClientId"),
+		CurrentUpdateIDs: values("updateId"),
+		UpdateGroupIDs:   values("updateGroupId"),
+		Branches:         values("branch"),
+		RuntimeVersions:  values("runtimeVersion"),
+		Platforms:        values("platform"),
+		DeviceModels:     values("deviceModel"),
+		OSNames:          values("osName"),
+		OSVersions:       values("osVersion"),
+		CountryCodes:     values("countryCode"),
+	}
+	pairs := values("attr")
+	if tooMany {
+		handlers.RenderError(
+			w,
+			http.StatusBadRequest,
+			"A device filter carries too many values.",
+		)
+		return DeviceQuery{}, false
+	}
+	if len(pairs) > 0 {
+		schema, err := service.GetSchema(r.Context(), appID)
+		if err != nil {
+			renderIdentityServiceError(w, err)
+			return DeviceQuery{}, false
+		}
+		// An undeclared key or a value that does not fit its type is a 400
+		// rather than an empty list: the registry only ever stores what the
+		// schema accepts, so the question itself is the thing that is wrong.
+		filters, err := ParseFilterPairs(schema, pairs)
+		if err != nil {
+			handlers.RenderError(w, http.StatusBadRequest, "'attr' must be key:value pairs of declared Identity attributes.")
+			return DeviceQuery{}, false
+		}
+		deviceQuery.Metadata = filters
+	}
+	// A malformed update id is a 400, not an empty list: silently dropping the
+	// filter would answer a different question than the one asked.
+	for name, ids := range map[string][]string{
+		"updateId":      deviceQuery.CurrentUpdateIDs,
+		"updateGroupId": deviceQuery.UpdateGroupIDs,
+		"easClientId":   deviceQuery.EASClientIDs,
+	} {
+		for _, id := range ids {
+			if _, err := uuid.Parse(id); err != nil {
+				handlers.RenderError(w, http.StatusBadRequest, "'"+name+"' must be a UUID.")
+				return DeviceQuery{}, false
+			}
+		}
+	}
+	return deviceQuery, true
+}
+
 func (h *IdentityHandler) ListDevicesHandler(w http.ResponseWriter, r *http.Request) {
 	service, ok := h.requireService(w)
 	if !ok {
@@ -194,9 +304,9 @@ func (h *IdentityHandler) ListDevicesHandler(w http.ResponseWriter, r *http.Requ
 	appID := mux.Vars(r)["APP_ID"]
 	query := r.URL.Query()
 
-	var filter *MetadataFilter
-	if fk, fv := query.Get("filterKey"), query.Get("filterValue"); fk != "" && fv != "" {
-		filter = &MetadataFilter{Key: fk, Value: fv}
+	deviceQuery, ok := parseDeviceQuery(w, r, service, appID)
+	if !ok {
+		return
 	}
 
 	cursor, err := decodeDeviceCursor(query.Get("cursor"))
@@ -206,7 +316,7 @@ func (h *IdentityHandler) ListDevicesHandler(w http.ResponseWriter, r *http.Requ
 	}
 	limit := parseLimit(query.Get("limit"), DefaultDevicesPageSize)
 
-	devices, next, err := service.ListDevices(r.Context(), appID, filter, limit, cursor)
+	devices, next, err := service.ListDevices(r.Context(), appID, deviceQuery, limit, cursor)
 	if err != nil {
 		renderIdentityServiceError(w, err)
 		return
@@ -218,6 +328,46 @@ func (h *IdentityHandler) ListDevicesHandler(w http.ResponseWriter, r *http.Requ
 	handlers.RenderJSON(w, http.StatusOK, map[string]any{
 		"devices":    items,
 		"nextCursor": encodeDeviceCursor(next),
+	})
+}
+
+// OnlineDevicesHandler answers "how many devices are live right now". Open to
+// any app viewer: it is a single count with no per-device detail. It takes the
+// same filters as the inventory, so the number can be shown next to filtered
+// figures without reading as a contradiction.
+func (h *IdentityHandler) OnlineDevicesHandler(w http.ResponseWriter, r *http.Request) {
+	service, ok := h.requireService(w)
+	if !ok {
+		return
+	}
+	appID := mux.Vars(r)["APP_ID"]
+	deviceQuery, ok := parseDeviceQuery(w, r, service, appID)
+	if !ok {
+		return
+	}
+	window := DefaultOnlineWindow
+	if raw := r.URL.Query().Get("minutes"); raw != "" {
+		minutes, err := strconv.Atoi(raw)
+		if err != nil || minutes < 1 {
+			handlers.RenderError(w, http.StatusBadRequest, "'minutes' must be a positive integer.")
+			return
+		}
+		// Clamped before the multiplication, not after: minutes is unbounded
+		// and time.Minute is 6e10 nanoseconds, so a large enough value wraps
+		// int64 and the reported window comes back negative.
+		if maximum := int(MaxOnlineWindow / time.Minute); minutes > maximum {
+			minutes = maximum
+		}
+		window = time.Duration(minutes) * time.Minute
+	}
+	count, err := service.CountOnlineDevices(r.Context(), appID, window, deviceQuery)
+	if err != nil {
+		renderIdentityServiceError(w, err)
+		return
+	}
+	handlers.RenderJSON(w, http.StatusOK, map[string]any{
+		"online":        count,
+		"windowMinutes": int(min(window, MaxOnlineWindow).Minutes()),
 	})
 }
 
@@ -260,11 +410,9 @@ func parseLimit(raw string, fallback int) int {
 }
 
 func sortSchemaKeys(keys []schemaKeyResponse) {
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j-1].Key > keys[j].Key; j-- {
-			keys[j-1], keys[j] = keys[j], keys[j-1]
-		}
-	}
+	slices.SortFunc(keys, func(left, right schemaKeyResponse) int {
+		return strings.Compare(left.Key, right.Key)
+	})
 }
 
 // The device cursor is opaque on the wire: base64 of "RFC3339Nano|uuid". The
@@ -300,4 +448,110 @@ func decodeDeviceCursor(encoded string) (*DeviceCursor, error) {
 		return nil, err
 	}
 	return &DeviceCursor{LastSeenAt: ts, EASClientID: parts[1]}, nil
+}
+
+// --- Update health (adoption + launch failures per update) ---
+
+// maxDeviceFilterValues bounds one device-inventory filter list, the same way
+// maxHealthUpdateIDs bounds the health one. A dashboard multi-select never
+// comes close; a hand-written URL can.
+const maxDeviceFilterValues = 100
+
+// maxHealthUpdateIDs bounds one health request; a branch page shows far
+// fewer updates than this.
+const maxHealthUpdateIDs = 100
+
+type updateHealthResponse struct {
+	DevicesOnUpdate int64 `json:"devicesOnUpdate"`
+	// SuccessfulDevices currently run the update and never reported it as
+	// faulty. Runtime crashes stay on the update, so they are removed here.
+	SuccessfulDevices int64 `json:"successfulDevices"`
+	// FaultyDevices reported either a launch rollback or a JS runtime crash.
+	// Counted per DEVICE, so a device contributes at most once whether it
+	// re-sends the same crash or reports both kinds for this update.
+	FaultyDevices int64 `json:"faultyDevices"`
+	// LaunchFailures is the same number as faultyDevices, kept for API
+	// compatibility; faultyDevices is the clearer name now that JS runtime
+	// crashes also contribute.
+	LaunchFailures int64 `json:"launchFailures"`
+	// UpdateIssues: crash at launch reported by the manifest error-recovery
+	// headers; the device rolled back off the update.
+	//
+	// updateIssues and runtimeIssues are NOT a partition of faultyDevices: a
+	// device that reported both kinds for this update is counted in each, so
+	// their sum can exceed faultyDevices. Use them as a breakdown by cause,
+	// never as addends.
+	UpdateIssues int64 `json:"updateIssues"`
+	// RuntimeIssues: JS crash while running the update, reported by the
+	// documented expo_open_ota_js_crash observe event; the device is
+	// (usually) still running the update.
+	RuntimeIssues int64 `json:"runtimeIssues"`
+	// HealthPercent is healthy/attempts over devices that actually attempted
+	// the update; null when nothing attempted it yet. Failed devices still
+	// counted in devicesOnUpdate (runtime crashes without rollback) are
+	// counted once as attempts and excluded from healthy.
+	HealthPercent *float64 `json:"healthPercent"`
+}
+
+// UpdateHealthHandler serves GET .../identity/update-health?ids=uuid,uuid:
+// the registry-backed instant-T health of a set of updates (the dashboard
+// passes the UUIDs it is displaying). Every id gets an entry, zeroes when
+// nothing was recorded for it.
+func (h *IdentityHandler) UpdateHealthHandler(w http.ResponseWriter, r *http.Request) {
+	service, ok := h.requireService(w)
+	if !ok {
+		return
+	}
+	appID := mux.Vars(r)["APP_ID"]
+	rawIDs := strings.Split(r.URL.Query().Get("ids"), ",")
+	ids := make([]string, 0, len(rawIDs))
+	for _, raw := range rawIDs {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			ids = append(ids, trimmed)
+		}
+	}
+	if len(ids) == 0 {
+		handlers.RenderError(w, http.StatusBadRequest, "Query parameter 'ids' is required.")
+		return
+	}
+	if len(ids) > maxHealthUpdateIDs {
+		handlers.RenderError(w, http.StatusBadRequest, "Too many update ids in one request.")
+		return
+	}
+
+	health, err := service.UpdateHealthByIDs(r.Context(), appID, ids)
+	if err != nil {
+		renderIdentityServiceError(w, err)
+		return
+	}
+	out := make(map[string]updateHealthResponse, len(ids))
+	for _, id := range ids {
+		parsed, err := uuid.Parse(id)
+		if err != nil {
+			continue // non-UUID input: no entry, never an error
+		}
+		entry := health[parsed.String()]
+		// The set size, not the sum of the breakdowns: a device that reported
+		// both a rollback and a JS crash for this update is in both counts.
+		failures := entry.FaultyDevices
+		successes := entry.DevicesOnUpdate - entry.FailedStillOn
+		response := updateHealthResponse{
+			DevicesOnUpdate:   entry.DevicesOnUpdate,
+			SuccessfulDevices: successes,
+			FaultyDevices:     failures,
+			LaunchFailures:    failures,
+			UpdateIssues:      entry.UpdateIssues,
+			RuntimeIssues:     entry.RuntimeIssues,
+		}
+		// A manifest rollback is faulty but no longer current; a JS crash is
+		// both faulty and current. successfulDevices removes that overlap, so
+		// the documented successes/(successes+faulty) formula counts every
+		// device exactly once.
+		if attempts := successes + failures; attempts > 0 {
+			percent := 100 * float64(successes) / float64(attempts)
+			response.HealthPercent = &percent
+		}
+		out[parsed.String()] = response
+	}
+	handlers.RenderJSON(w, http.StatusOK, map[string]any{"updates": out})
 }

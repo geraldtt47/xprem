@@ -53,31 +53,48 @@ func (s *RBACService) resolveSubject(w http.ResponseWriter, r *http.Request) (Su
 	return Subject{UserID: principal.UserId, IsAdmin: user.IsAdmin}, true
 }
 
-// RequirePermission guards one app-scoped dashboard mutation: admins pass,
-// members need the permission on the route's APP_ID. It replaces the
-// community adminOnly gate on these routes, and degrades to exactly its
-// behavior when roles are not enforced (no control plane, no valid license):
-// members get the same 403 an admin-only route gives them today.
-func RequirePermission(service *RBACService, perm Permission) mux.MiddlewareFunc {
+// RequirePermission guards one app-scoped dashboard action: admins pass,
+// members need the permission on the route's APP_ID. When roles are not
+// enforced (no control plane, no valid license) there are no grants to read,
+// and the route's own fallback decides instead: see Fallback.
+func RequirePermission(service *RBACService, perm Permission, fallback Fallback) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			subject, ok := service.resolveSubject(w, r)
-			if !ok {
-				return
-			}
-			appId := mux.Vars(r)["APP_ID"]
-			if appId == "" {
-				handlers.RenderError(w, http.StatusBadRequest, "invalid app id")
-				return
-			}
-			if err := service.Authorize(r.Context(), subject, appId, perm); err != nil {
-				service.recordDenied(r, subject, appId, err, map[string]any{"permission": string(perm)})
-				renderAuthorizeError(w, err)
+			if !authorizeRequest(service, w, r, perm, fallback) {
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// authorizeRequest is the decision RequirePermission wraps, split out so the
+// middleware stays three lines. Deliberately unexported: a handler that
+// authorizes itself is a permission nobody can find by reading the routing
+// table, and the one endpoint that seemed to need it turned out to be two
+// endpoints wearing one URL.
+func authorizeRequest(
+	service *RBACService,
+	w http.ResponseWriter,
+	r *http.Request,
+	perm Permission,
+	fallback Fallback,
+) bool {
+	subject, ok := service.resolveSubject(w, r)
+	if !ok {
+		return false
+	}
+	appId := mux.Vars(r)["APP_ID"]
+	if appId == "" {
+		handlers.RenderError(w, http.StatusBadRequest, "invalid app id")
+		return false
+	}
+	if err := service.Authorize(r.Context(), subject, appId, perm, fallback); err != nil {
+		service.recordDenied(r, subject, appId, err, map[string]any{"permission": string(perm)})
+		renderAuthorizeError(w, err)
+		return false
+	}
+	return true
 }
 
 // recordDenied reports a refusal to the audit trail: permission.denied is the

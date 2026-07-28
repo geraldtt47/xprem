@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -587,4 +588,27 @@ func (s *PostgresUpdateStore) CreateRollback(ctx context.Context, appId string, 
 		CreatedAt:      time.Duration(row.CreatedAt.Time.UnixNano()),
 		AppId:          pgAppID.String(),
 	}, nil
+}
+
+// GetUpdateOriginByUUID resolves both dimensions the observe flattener
+// denormalizes onto every row: the branch of an update and the publish it came
+// from. Both are permanent properties of the update, so one cached lookup
+// covers the batch. An empty group is data, not an error: older CLIs and
+// rollback markers have none.
+func (s *PostgresUpdateStore) GetUpdateOriginByUUID(ctx context.Context, appID string, updateUUID string) (string, string, error) {
+	row, err := s.engine.GetUpdateOriginByUUID(ctx, pgdb.GetUpdateOriginByUUIDParams{
+		AppID:      ToPgUUID(appID),
+		UpdateUuid: ToPgUUID(updateUUID),
+	})
+	if err != nil {
+		if database.IsNoRows(err) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	group := ""
+	if row.PublishGroup.Valid {
+		group = uuid.UUID(row.PublishGroup.Bytes).String()
+	}
+	return row.BranchName, group, nil
 }

@@ -20,13 +20,13 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"expo-open-ota/internal/database"
 	"expo-open-ota/internal/database/postgres"
 	"expo-open-ota/internal/database/postgres/pgdb"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
@@ -40,7 +40,7 @@ func setupIdentityStore(t *testing.T) (*PostgresIdentityStore, *pgxpool.Pool) {
 		if os.Getenv("CI") != "" {
 			t.Fatal("TEST_DATABASE_URL must be set in CI: these tests cover SQL that unit tests cannot reach")
 		}
-		t.Skip("TEST_DATABASE_URL not set — start a Postgres and set it to run the identity store tests")
+		t.Skip("TEST_DATABASE_URL not set; start a Postgres and set it to run the identity store tests")
 	}
 	t.Setenv("ADMIN_EMAIL", "seed-admin@example.com")
 	t.Setenv("ADMIN_PASSWORD", "Sup3rSecret!")
@@ -49,14 +49,16 @@ func setupIdentityStore(t *testing.T) (*PostgresIdentityStore, *pgxpool.Pool) {
 	pool, err := pgxpool.New(context.Background(), dbURL)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	// Licensed by default so the free-tier cap is inert; the cap test builds
-	// its own unlicensed store.
 	store := NewPostgresIdentityStore(&database.Engine{Queries: pgdb.New(pool), DB: pool})
-	store.licenseValid = alwaysLicensed
 	return store, pool
 }
 
-func alwaysLicensed() bool { return true }
+// observed names an update a check-in reports as running now. The store
+// refuses an observation older than the one it holds, and these tests are
+// always the freshest news about their device.
+func observed(updateID string) *CurrentUpdate {
+	return &CurrentUpdate{ID: updateID, ObservedAt: time.Now().UTC()}
+}
 
 func seedApp(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
@@ -67,6 +69,57 @@ func seedApp(t *testing.T, pool *pgxpool.Pool) string {
 		_, _ = pool.Exec(context.Background(), "DELETE FROM apps WHERE id = $1", appID)
 	})
 	return appID
+}
+
+func seedPublishedUpdate(t *testing.T, pool *pgxpool.Pool, appID, updateID string) {
+	t.Helper()
+	ctx := context.Background()
+	suffix := updateID[:8]
+	var branchID, runtimeVersionID int64
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO branches (app_id, name) VALUES ($1, $2) RETURNING id",
+		appID, "health-"+suffix).Scan(&branchID))
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO runtime_versions (app_id, version) VALUES ($1, $2) RETURNING id",
+		appID, "health-"+suffix).Scan(&runtimeVersionID))
+	// updates.id is assigned by the publish path rather than by a sequence, so
+	// it is allocated here: a test seeding two updates would otherwise collide
+	// on a hardcoded one.
+	_, err := pool.Exec(ctx, `
+		INSERT INTO updates
+			(id, update_uuid, branch_id, runtime_version_id, update_type, commit_hash, platform, checked_at)
+		SELECT COALESCE(MAX(id), 0) + 1, $1, $2, $3, 0, 'health-test', 'ios', CURRENT_TIMESTAMP FROM updates`,
+		updateID, branchID, runtimeVersionID)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM branches WHERE id = $1", branchID)
+		_, _ = pool.Exec(context.Background(), "DELETE FROM runtime_versions WHERE id = $1", runtimeVersionID)
+	})
+}
+
+// Same fixture as seedPublishedUpdate, with an explicit publish group and a
+// row id of its own so several updates can coexist.
+func seedGroupedUpdate(t *testing.T, pool *pgxpool.Pool, appID, updateID, publishGroup string, rowID int64) {
+	t.Helper()
+	ctx := context.Background()
+	suffix := updateID[:8]
+	var branchID, runtimeVersionID int64
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO branches (app_id, name) VALUES ($1, $2) RETURNING id",
+		appID, "group-"+suffix).Scan(&branchID))
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO runtime_versions (app_id, version) VALUES ($1, $2) RETURNING id",
+		appID, "group-"+suffix).Scan(&runtimeVersionID))
+	_, err := pool.Exec(ctx, `
+		INSERT INTO updates
+			(id, update_uuid, branch_id, runtime_version_id, update_type, commit_hash, platform, checked_at, publish_group)
+		VALUES ($5, $1, $2, $3, 0, 'group-test', 'android', CURRENT_TIMESTAMP, $4)`,
+		updateID, branchID, runtimeVersionID, publishGroup, rowID)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM branches WHERE id = $1", branchID)
+		_, _ = pool.Exec(context.Background(), "DELETE FROM runtime_versions WHERE id = $1", runtimeVersionID)
+	})
 }
 
 func declareKey(t *testing.T, store *PostgresIdentityStore, appID, key string, valueType ValueType) {
@@ -514,7 +567,7 @@ func TestListDevicesPaginationAndFilter(t *testing.T) {
 	var seen []string
 	var cursor *DeviceCursor
 	for {
-		devices, next, err := store.ListDevices(ctx, appID, nil, 2, cursor)
+		devices, next, err := store.ListDevices(ctx, appID, DeviceQuery{}, 2, cursor)
 		require.NoError(t, err)
 		for _, d := range devices {
 			seen = append(seen, d.EASClientID)
@@ -532,7 +585,7 @@ func TestListDevicesPaginationAndFilter(t *testing.T) {
 	require.Len(t, uniqueStrings(seen), 5)
 
 	// Filter to tenant=globex (devices 1 and 3): 2 of them.
-	filtered, next, err := store.ListDevices(ctx, appID, &MetadataFilter{Key: "tenant", Value: "globex"}, 10, nil)
+	filtered, next, err := store.ListDevices(ctx, appID, DeviceQuery{Metadata: MetadataFilters{{Key: "tenant", Values: []any{"globex"}}}}, 10, nil)
 	require.NoError(t, err)
 	require.Nil(t, next)
 	require.Len(t, filtered, 2)
@@ -541,9 +594,49 @@ func TestListDevicesPaginationAndFilter(t *testing.T) {
 	}
 
 	// A filter matching nothing returns an empty page.
-	none, _, err := store.ListDevices(ctx, appID, &MetadataFilter{Key: "tenant", Value: "nope"}, 10, nil)
+	none, _, err := store.ListDevices(ctx, appID, DeviceQuery{Metadata: MetadataFilters{{Key: "tenant", Values: []any{"nope"}}}}, 10, nil)
 	require.NoError(t, err)
 	require.Empty(t, none)
+}
+
+// Containment against JSONB is type-aware, so a boolean or a number has to
+// reach the store as one: filtering `canary` with the string "true" matches a
+// row stored as `true` in no database.
+func TestListDevicesFilterOnTypedValues(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	declareKey(t, store, appID, "canary", ValueTypeBoolean)
+	declareKey(t, store, appID, "planLevel", ValueTypeNumber)
+
+	for i := 0; i < 4; i++ {
+		_, err := store.ApplySet(ctx, appID, uuid.NewString(), map[string]any{
+			"canary":    i%2 == 1,
+			"planLevel": float64(i),
+		}, nil)
+		require.NoError(t, err)
+	}
+
+	canaries, _, err := store.ListDevices(ctx, appID, DeviceQuery{Metadata: MetadataFilters{{Key: "canary", Values: []any{true}}}}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, canaries, 2)
+
+	level, _, err := store.ListDevices(ctx, appID, DeviceQuery{Metadata: MetadataFilters{{Key: "planLevel", Values: []any{float64(2)}}}}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, level, 1)
+
+	// Several values on one key is a union, which is how a comparison across
+	// two plans reaches the store.
+	levels, _, err := store.ListDevices(ctx, appID, DeviceQuery{
+		Metadata: MetadataFilters{{Key: "planLevel", Values: []any{float64(2), float64(3)}}},
+	}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, levels, 2)
+
+	// The same filter spelled as text, which is what the bug was.
+	asText, _, err := store.ListDevices(ctx, appID, DeviceQuery{Metadata: MetadataFilters{{Key: "canary", Values: []any{"true"}}}}, 10, nil)
+	require.NoError(t, err)
+	require.Empty(t, asText)
 }
 
 // When many devices share the exact same last_seen_at (the likely case: a
@@ -567,7 +660,7 @@ func TestListDevicesKeysetUnderTies(t *testing.T) {
 	var seen []string
 	var cursor *DeviceCursor
 	for {
-		devices, next, err := store.ListDevices(ctx, appID, nil, 2, cursor)
+		devices, next, err := store.ListDevices(ctx, appID, DeviceQuery{}, 2, cursor)
 		require.NoError(t, err)
 		for _, d := range devices {
 			seen = append(seen, d.EASClientID)
@@ -595,109 +688,1221 @@ func uniqueStrings(in []string) []string {
 	return out
 }
 
-// unlicensedStore builds a store with the free-tier cap active at a small
-// limit so the eviction path is testable without seeding a thousand rows.
-func unlicensedStore(pool *pgxpool.Pool, limit int) *PostgresIdentityStore {
-	s := NewPostgresIdentityStore(&database.Engine{Queries: pgdb.New(pool), DB: pool})
-	s.licenseValid = func() bool { return false }
-	s.deviceLimit = limit
-	return s
-}
-
-func TestFreeTierCapEvictsOldest(t *testing.T) {
-	_, pool := setupIdentityStore(t)
+func TestTouchDeviceRegistersAndBumps(t *testing.T) {
+	store, pool := setupIdentityStore(t)
 	appID := seedApp(t, pool)
 	ctx := context.Background()
-	store := unlicensedStore(pool, 3)
-	declareKey(t, store, appID, "tenant", ValueTypeString)
 
-	// Register 3 devices (at the cap). Stagger last_seen via distinct txns.
-	ids := make([]string, 4)
-	for i := 0; i < 3; i++ {
-		ids[i] = uuid.NewString()
-		_, err := store.ApplySet(ctx, appID, ids[i], map[string]any{"tenant": "acme"}, nil)
-		require.NoError(t, err)
-	}
-	count, err := store.engine.Queries.CountDevices(ctx, mustPgUUID(t, appID))
+	// First contact registers the device; the registry is uncapped.
+	deviceID := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+	created, err := store.GetDevice(ctx, appID, deviceID)
 	require.NoError(t, err)
-	require.Equal(t, int64(3), count)
+	require.NotNil(t, created)
 
-	// A 4th device evicts the oldest (ids[0]); count stays at the cap.
-	ids[3] = uuid.NewString()
-	_, err = store.ApplySet(ctx, appID, ids[3], map[string]any{"tenant": "globex"}, nil)
+	// A later contact bumps last_seen, never touching metadata.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+	bumped, err := store.GetDevice(ctx, appID, deviceID)
 	require.NoError(t, err)
-
-	count, err = store.engine.Queries.CountDevices(ctx, mustPgUUID(t, appID))
-	require.NoError(t, err)
-	require.Equal(t, int64(3), count, "cap holds the app at the limit")
-
-	// The oldest is gone, the newest is present.
-	evicted, err := store.GetDevice(ctx, appID, ids[0])
-	require.NoError(t, err)
-	require.Nil(t, evicted, "the oldest device was evicted")
-	newest, err := store.GetDevice(ctx, appID, ids[3])
-	require.NoError(t, err)
-	require.NotNil(t, newest)
-
-	// Value stats followed the eviction: acme went 3 -> 2 (one evicted),
-	// globex is 1. No ghost counts from the evicted device.
-	values, err := store.SearchMetadataValues(ctx, appID, "tenant", "", 10)
-	require.NoError(t, err)
-	require.ElementsMatch(t, []ValueCount{{Value: "acme", DeviceCount: 2}, {Value: "globex", DeviceCount: 1}}, values)
+	require.NotNil(t, bumped)
+	require.False(t, bumped.LastSeenAt.Before(created.LastSeenAt))
+	require.Empty(t, bumped.Metadata)
 }
 
-func TestLicensedStoreHasNoCap(t *testing.T) {
-	baseline, pool := setupIdentityStore(t) // alwaysLicensed
+func TestTouchDeviceGeoCoalesce(t *testing.T) {
+	store, pool := setupIdentityStore(t)
 	appID := seedApp(t, pool)
 	ctx := context.Background()
-	// Same tiny limit, but licensed → cap inert.
-	licensed := NewPostgresIdentityStore(&database.Engine{Queries: pgdb.New(pool), DB: pool})
-	licensed.licenseValid = func() bool { return true }
-	licensed.deviceLimit = 3
-	_ = baseline
 
-	for i := 0; i < 6; i++ {
-		_, err := licensed.ApplySet(ctx, appID, uuid.NewString(), map[string]any{}, nil)
-		require.NoError(t, err)
-	}
-	count, err := licensed.engine.Queries.CountDevices(ctx, mustPgUUID(t, appID))
+	deviceID := uuid.NewString()
+	country := "FR"
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, &Geo{CountryCode: &country}, nil, DeviceInfo{}))
+
+	// A later contact resolving no geo must not erase the known one.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+	device, err := store.GetDevice(ctx, appID, deviceID)
 	require.NoError(t, err)
-	require.Equal(t, int64(6), count, "a valid license lifts the cap")
+	require.NotNil(t, device)
+	require.NotNil(t, device.CountryCode)
+	require.Equal(t, "FR", *device.CountryCode)
 }
 
-// Updates to existing devices must not trigger eviction (only new inserts do).
-func TestFreeTierCapIgnoresUpdates(t *testing.T) {
-	_, pool := setupIdentityStore(t)
+// Two first contacts of the same brand-new device race: both must succeed
+// (the loser lands on RegisterDevice's ON CONFLICT bump) and exactly one row
+// may exist. This is the contract the uncapped registry keeps.
+func TestTouchDeviceConcurrentSameDevice(t *testing.T) {
+	store, pool := setupIdentityStore(t)
 	appID := seedApp(t, pool)
 	ctx := context.Background()
-	store := unlicensedStore(pool, 3)
-	declareKey(t, store, appID, "tenant", ValueTypeString)
+	deviceID := uuid.NewString()
 
-	ids := make([]string, 3)
-	for i := 0; i < 3; i++ {
-		ids[i] = uuid.NewString()
-		_, err := store.ApplySet(ctx, appID, ids[i], map[string]any{"tenant": "acme"}, nil)
-		require.NoError(t, err)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+		}()
 	}
-	// Re-identify the OLDEST many times: it stays (updates don't evict), and
-	// no device is dropped.
-	for i := 0; i < 5; i++ {
-		_, err := store.ApplySet(ctx, appID, ids[0], map[string]any{"tenant": "acme"}, nil)
-		require.NoError(t, err)
-	}
-	count, err := store.engine.Queries.CountDevices(ctx, mustPgUUID(t, appID))
-	require.NoError(t, err)
-	require.Equal(t, int64(3), count)
-	for _, id := range ids {
-		d, err := store.GetDevice(ctx, appID, id)
-		require.NoError(t, err)
-		require.NotNil(t, d, "no device evicted on updates")
-	}
+	wg.Wait()
+
+	var rows int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM device_identity WHERE app_id = $1 AND eas_client_id = $2", appID, deviceID).Scan(&rows))
+	require.Equal(t, 1, rows)
 }
 
-func mustPgUUID(t *testing.T, id string) pgtype.UUID {
+func TestTouchDeviceTracksCurrentUpdate(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	deviceID := uuid.NewString()
+	updateA, updateB := uuid.NewString(), uuid.NewString()
+	// Both are real publishes: the registry only records an update the server
+	// knows, so a fixture naming one it never published is testing nothing.
+	seedPublishedUpdate(t, pool, appID, updateA)
+	seedPublishedUpdate(t, pool, appID, updateB)
+
+	// Registration carries the running update.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, observed(updateA), DeviceInfo{}))
+	var current *string
+	readCurrent := func() *string {
+		t.Helper()
+		var v *string
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT current_update_id::text FROM device_identity WHERE app_id = $1 AND eas_client_id = $2", appID, deviceID).Scan(&v))
+		return v
+	}
+	current = readCurrent()
+	require.NotNil(t, current)
+	require.Equal(t, updateA, *current)
+
+	// A contact that does not know (nil) keeps the known value.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+	current = readCurrent()
+	require.NotNil(t, current)
+	require.Equal(t, updateA, *current)
+
+	// A transition overwrites it.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, observed(updateB), DeviceInfo{}))
+	current = readCurrent()
+	require.NotNil(t, current)
+	require.Equal(t, updateB, *current)
+
+	// The history bridge records state transitions, not every contact. The
+	// nil contact above therefore emits nothing.
+	type stateEvent struct {
+		EventType        string
+		UpdateID         string
+		PreviousUpdateID *string
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT event_type, update_id::text, previous_update_id::text
+		FROM device_health_outbox
+		WHERE app_id = $1 AND eas_client_id = $2
+		ORDER BY id`, appID, deviceID)
+	require.NoError(t, err)
+	defer rows.Close()
+	var events []stateEvent
+	for rows.Next() {
+		var event stateEvent
+		require.NoError(t, rows.Scan(&event.EventType, &event.UpdateID, &event.PreviousUpdateID))
+		events = append(events, event)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []stateEvent{
+		{EventType: "first_seen", UpdateID: updateA},
+		{EventType: "switched", UpdateID: updateB, PreviousUpdateID: &updateA},
+	}, events)
+}
+
+func TestRecordUpdateFailuresCaptureOnce(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	deviceID := uuid.NewString()
+	failedUpdate := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, failedUpdate)
+
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+
+	// The crash poll captures the fatal error...
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, deviceID, []string{failedUpdate}, "TypeError: boom", FailureTypeUpdate))
+	// ...sticky re-sends carry no error and must not blank it, nor duplicate.
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, deviceID, []string{failedUpdate}, "", FailureTypeUpdate))
+	// The other source is a row of its own since failure_type joined the key
+	// (20260726140000_failure_type_in_key.sql): a runtime crash reported for the
+	// same pair must not land on the rollback's row and retype it.
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, deviceID, []string{failedUpdate}, "different error", FailureTypeRuntime))
+	// Forged ids in the list are skipped without failing.
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, deviceID, []string{"garbage", failedUpdate}, "", FailureTypeUpdate))
+
+	var rows int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM device_update_failures WHERE app_id = $1 AND update_id = $2", appID, failedUpdate).Scan(&rows))
+	require.Equal(t, 2, rows, "one row per (device, update, failure_type); sticky re-sends of each collapse")
+
+	// Capture-once holds within each type: the first non-empty error wins and a
+	// later re-send neither blanks nor replaces it.
+	var fatal string
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT fatal_error FROM device_update_failures WHERE app_id = $1 AND update_id = $2 AND failure_type = $3",
+		appID, failedUpdate, string(FailureTypeUpdate)).Scan(&fatal))
+	require.Equal(t, "TypeError: boom", fatal)
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT fatal_error FROM device_update_failures WHERE app_id = $1 AND update_id = $2 AND failure_type = $3",
+		appID, failedUpdate, string(FailureTypeRuntime)).Scan(&fatal))
+	require.Equal(t, "different error", fatal)
+
+	var outboxRows int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM device_health_outbox
+		WHERE app_id = $1
+		  AND eas_client_id = $2
+		  AND update_id = $3
+		  AND event_type = 'failure'`,
+		appID, deviceID, failedUpdate).Scan(&outboxRows))
+	// One per failure KIND, not per re-send: the four calls above insert two
+	// rows and re-send onto them. Both events carry the same
+	// (app, device, update), the triple update_crashes is keyed on, so they
+	// collapse to one row downstream.
+	require.Equal(t, 2, outboxRows, "replayed failure headers must emit one historical event per kind")
+}
+
+func TestRuntimeFailureRecoveryUsesEventTime(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	deviceID := uuid.NewString()
+	updateID := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, updateID)
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, observed(updateID), DeviceInfo{}))
+
+	crashedAt := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Millisecond)
+	require.NoError(t, store.RecordRuntimeFailure(
+		ctx, appID, deviceID, updateID, "TypeError: boom", crashedAt,
+	))
+
+	// A startup at the same instant cannot prove that a later JS session ran:
+	// crash wins ties.
+	require.NoError(t, store.ResolveRuntimeFailure(ctx, appID, deviceID, updateID, crashedAt))
+	health, err := store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, health[updateID].RuntimeIssues)
+	require.EqualValues(t, 1, health[updateID].FailedStillOn)
+
+	recoveredAt := crashedAt.Add(time.Second)
+	require.NoError(t, store.ResolveRuntimeFailure(ctx, appID, deviceID, updateID, recoveredAt))
+	health, err = store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	require.Zero(t, health[updateID].RuntimeIssues)
+	require.Zero(t, health[updateID].FailedStillOn)
+
+	// An offline batch may deliver an older crash after the recovery. Event
+	// time, not ingestion order, keeps the device healthy.
+	require.NoError(t, store.RecordRuntimeFailure(
+		ctx, appID, deviceID, updateID, "late old crash", crashedAt.Add(-time.Second),
+	))
+	health, err = store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	require.Zero(t, health[updateID].RuntimeIssues)
+
+	// A genuinely newer crash reopens the same row and emits another immutable
+	// transition; the following newer startup resolves it again.
+	secondCrashAt := recoveredAt.Add(time.Second)
+	require.NoError(t, store.RecordRuntimeFailure(
+		ctx, appID, deviceID, updateID, "second crash", secondCrashAt,
+	))
+	health, err = store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, health[updateID].RuntimeIssues)
+	require.NoError(t, store.ResolveRuntimeFailure(
+		ctx, appID, deviceID, updateID, secondCrashAt.Add(time.Second),
+	))
+
+	rows, err := pool.Query(ctx, `
+		SELECT event_type, occurred_at
+		FROM device_health_outbox
+		WHERE app_id = $1 AND eas_client_id = $2 AND update_id = $3
+		  AND event_type IN ('failure', 'recovered')
+		ORDER BY occurred_at, event_type`,
+		appID, deviceID, updateID)
+	require.NoError(t, err)
+	defer rows.Close()
+	type transition struct {
+		eventType  string
+		occurredAt time.Time
+	}
+	var transitions []transition
+	for rows.Next() {
+		var item transition
+		require.NoError(t, rows.Scan(&item.eventType, &item.occurredAt))
+		item.occurredAt = item.occurredAt.UTC()
+		transitions = append(transitions, item)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []transition{
+		{eventType: "failure", occurredAt: crashedAt},
+		{eventType: "recovered", occurredAt: recoveredAt},
+		{eventType: "failure", occurredAt: secondCrashAt},
+		{eventType: "recovered", occurredAt: secondCrashAt.Add(time.Second)},
+	}, transitions)
+
+	// A startup can reach the server before a delayed older crash from another
+	// batch. The standalone runtime watermark must remember it even though no
+	// failure row exists yet.
+	otherDeviceID := uuid.NewString()
+	startedAt := crashedAt.Add(5 * time.Minute)
+	require.NoError(t, store.ResolveRuntimeFailure(
+		ctx, appID, otherDeviceID, updateID, startedAt,
+	))
+	require.NoError(t, store.RecordRuntimeFailure(
+		ctx, appID, otherDeviceID, updateID, "offline old crash", startedAt.Add(-time.Second),
+	))
+	health, err = store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	require.Zero(t, health[updateID].RuntimeIssues)
+	var otherFailureRows int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM device_update_failures
+		WHERE app_id = $1 AND eas_client_id = $2 AND update_id = $3`,
+		appID, otherDeviceID, updateID).Scan(&otherFailureRows))
+	require.Zero(t, otherFailureRows)
+}
+
+func TestRecordUpdateFailuresRejectsAnotherAppsUpdate(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	otherAppID := seedApp(t, pool)
+	foreignUpdate := uuid.NewString()
+	seedPublishedUpdate(t, pool, otherAppID, foreignUpdate)
+
+	require.NoError(t, store.RecordUpdateFailures(
+		context.Background(), appID, uuid.NewString(), []string{foreignUpdate},
+		"forged", FailureTypeUpdate,
+	))
+
+	var rows int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		"SELECT COUNT(*) FROM device_update_failures WHERE app_id = $1 AND update_id = $2",
+		appID, foreignUpdate).Scan(&rows))
+	require.Zero(t, rows)
+}
+
+func TestHealthSnapshotsKeepActiveRolloutCandidateAndControl(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	controlUUID, candidateUUID := uuid.NewString(), uuid.NewString()
+
+	var branchID, runtimeVersionID int64
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO branches (app_id, name) VALUES ($1, 'snapshot-rollout') RETURNING id",
+		appID).Scan(&branchID))
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO runtime_versions (app_id, version) VALUES ($1, 'snapshot-rollout') RETURNING id",
+		appID).Scan(&runtimeVersionID))
+	_, err := pool.Exec(ctx, `
+		INSERT INTO updates
+			(id, update_uuid, branch_id, runtime_version_id, update_type, commit_hash, platform, checked_at)
+		VALUES
+			(1, $1, $3, $4, 0, 'control', 'ios', CURRENT_TIMESTAMP),
+			(2, $2, $3, $4, 0, 'candidate', 'ios', CURRENT_TIMESTAMP)`,
+		controlUUID, candidateUUID, branchID, runtimeVersionID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		UPDATE updates
+		SET rollout_percentage = 10, control_update_id = 1
+		WHERE branch_id = $1 AND id = 2`,
+		branchID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.TouchDevice(ctx, appID, uuid.NewString(), nil, observed(controlUUID), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, uuid.NewString(), nil, observed(candidateUUID), DeviceInfo{}))
+
+	readRoles := func() map[string]string {
+		t.Helper()
+		rows, err := store.engine.Queries.ListCurrentUpdateHealthSnapshots(ctx)
+		require.NoError(t, err)
+		roles := make(map[string]string)
+		for _, row := range rows {
+			if uuid.UUID(row.AppID.Bytes).String() == appID {
+				roles[uuid.UUID(row.UpdateUuid.Bytes).String()] = row.Role
+				require.Positive(t, row.DevicesOnUpdate)
+			}
+		}
+		return roles
+	}
+	require.Equal(t, map[string]string{
+		candidateUUID: "candidate",
+		controlUUID:   "control",
+	}, readRoles())
+
+	// Once the rollout finishes the control stops being watched as a control,
+	// but a device is still on it: "how many are stuck on the old one" is only
+	// answerable if the series keeps being recorded, so it becomes legacy
+	// rather than disappearing.
+	_, err = pool.Exec(ctx, `
+		UPDATE updates
+		SET rollout_percentage = NULL
+		WHERE branch_id = $1 AND id = 2`, branchID)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		candidateUUID: "current",
+		controlUUID:   "legacy",
+	}, readRoles())
+
+	// An update nobody runs any more earns no row: the series is bounded by
+	// where the fleet sits, not by everything ever published.
+	_, err = pool.Exec(ctx,
+		"UPDATE device_identity SET current_update_id = $1 WHERE app_id = $2 AND current_update_id = $3",
+		candidateUUID, appID, controlUUID)
+	require.NoError(t, err)
+	roles := readRoles()
+	require.NotContains(t, roles, controlUUID)
+	require.Equal(t, "current", roles[candidateUUID])
+}
+
+// The two failure sources describe different events on the same (device,
+// update) pair. They shared one row until failure_type joined the key, and
+// whichever landed first owned the type: these two tests pin both orders.
+//
+// Order 1: a JS crash, then a launch rollback. The rollback must not inherit
+// 'runtime_issue', because a later successful start resolves runtime rows and
+// would erase durable evidence of a native rollback.
+func TestRuntimeCrashThenLaunchRollbackKeepBothTypes(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	updateID := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, updateID)
+	device := uuid.NewString()
+	crashedAt := time.Now().Add(-10 * time.Minute)
+
+	require.NoError(t, store.RecordRuntimeFailure(ctx, appID, device, updateID, "js boom", crashedAt))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{updateID}, "native boom", FailureTypeUpdate))
+
+	health, err := store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	entry := health[updateID]
+	require.EqualValues(t, 1, entry.UpdateIssues, "the rollback must be typed update_issue")
+	require.EqualValues(t, 1, entry.RuntimeIssues, "the JS crash must keep its own row")
+	require.EqualValues(t, 1, entry.FaultyDevices, "one device, counted once")
+
+	// A successful start resolves the runtime row and only the runtime row.
+	require.NoError(t, store.ResolveRuntimeFailure(ctx, appID, device, updateID, time.Now()))
+	health, err = store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	entry = health[updateID]
+	require.EqualValues(t, 0, entry.RuntimeIssues, "the JS crash is resolved")
+	require.EqualValues(t, 1, entry.UpdateIssues, "the rollback is durable and must survive")
+	require.EqualValues(t, 1, entry.FaultyDevices)
+}
+
+// Order 2: a launch rollback, then a JS crash. The crash must not be swallowed
+// by the update_issue row, which no successful start can ever resolve.
+func TestLaunchRollbackThenRuntimeCrashKeepBothTypes(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	updateID := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, updateID)
+	device := uuid.NewString()
+
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{updateID}, "native boom", FailureTypeUpdate))
+	require.NoError(t, store.RecordRuntimeFailure(ctx, appID, device, updateID, "js boom", time.Now().Add(-time.Minute)))
+
+	health, err := store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	entry := health[updateID]
+	require.EqualValues(t, 1, entry.RuntimeIssues, "the JS crash must be visible as a runtime issue")
+	require.EqualValues(t, 1, entry.UpdateIssues)
+	require.EqualValues(t, 1, entry.FaultyDevices, "still one device")
+
+	// And it is resolvable, which it never was while it shared the rollback's row.
+	require.NoError(t, store.ResolveRuntimeFailure(ctx, appID, device, updateID, time.Now()))
+	health, err = store.UpdateHealthByIDs(ctx, appID, []string{updateID})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, health[updateID].RuntimeIssues)
+}
+
+func TestUpdateHealthCounts(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	updateA, updateB := uuid.NewString(), uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, updateA)
+	seedPublishedUpdate(t, pool, appID, updateB)
+
+	// 2 devices on A, 1 on B, 1 on the embedded bundle; B crashed on one.
+	d1, d2, d3, d4 := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, d1, nil, observed(updateA), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, d2, nil, observed(updateA), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, d3, nil, observed(updateB), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, d4, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, d4, []string{updateB}, "crashed at launch", FailureTypeUpdate))
+
+	appUUID, err := toPgUUID(appID)
+	require.NoError(t, err)
+	updateAUUID, err := toPgUUID(updateA)
+	require.NoError(t, err)
+	updateBUUID, err := toPgUUID(updateB)
+	require.NoError(t, err)
+
+	onA, err := store.engine.CountDevicesOnUpdate(ctx, pgdb.CountDevicesOnUpdateParams{AppID: appUUID, CurrentUpdateID: updateAUUID})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, onA)
+	failuresB, err := store.engine.CountUpdateFailures(ctx, pgdb.CountUpdateFailuresParams{AppID: appUUID, UpdateID: updateBUUID})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, failuresB)
+
+	breakdown, err := store.engine.AdoptionBreakdown(ctx, appUUID)
+	require.NoError(t, err)
+	require.Len(t, breakdown, 3, "A cohort, B cohort, embedded-bundle cohort")
+	require.EqualValues(t, 2, breakdown[0].DeviceCount)
+}
+
+func TestUpdateHealthByIDs(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	updateA, updateB, updateGhost := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	// A and B are real publishes; the ghost deliberately is not, since the
+	// point of it is an update nothing ever ran.
+	seedPublishedUpdate(t, pool, appID, updateA)
+	seedPublishedUpdate(t, pool, appID, updateB)
+
+	// 2 devices running A this month, 1 running B; B also crashed at launch
+	// on d4 (rolled back, current unknown).
+	d1, d2, d3, d4 := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, d1, nil, observed(updateA), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, d2, nil, observed(updateA), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, d3, nil, observed(updateB), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, d4, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, d4, []string{updateB}, "boom", FailureTypeUpdate))
+
+	// JS crashes on B: d5 crashed and still runs it (the usual runtime_issue
+	// shape), d6 crashed then moved on to A (the mismatch case the overlap
+	// join must self-correct).
+	d5, d6 := uuid.NewString(), uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, d5, nil, observed(updateB), DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, d5, []string{updateB}, "TypeError: boom", FailureTypeRuntime))
+	require.NoError(t, store.TouchDevice(ctx, appID, d6, nil, observed(updateB), DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, d6, []string{updateB}, "", FailureTypeRuntime))
+	require.NoError(t, store.TouchDevice(ctx, appID, d6, nil, observed(updateA), DeviceInfo{}))
+
+	// Adoption is the TOTAL population on the update: a device last seen a
+	// month ago still runs it and still counts.
+	dOld := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, dOld, nil, observed(updateA), DeviceInfo{}))
+	_, err := pool.Exec(ctx,
+		"UPDATE device_identity SET last_seen_at = date_trunc('month', CURRENT_TIMESTAMP) - INTERVAL '1 day' WHERE app_id = $1 AND eas_client_id = $2",
+		appID, dOld)
+	require.NoError(t, err)
+
+	health, err := store.UpdateHealthByIDs(ctx, appID, []string{updateA, updateB, updateGhost, "not-a-uuid"})
+	require.NoError(t, err)
+	require.EqualValues(t, 4, health[updateA].DevicesOnUpdate, "d1, d2, dOld and the moved-on d6")
+	require.Zero(t, health[updateA].UpdateIssues)
+	require.Zero(t, health[updateA].RuntimeIssues)
+	require.EqualValues(t, 2, health[updateB].DevicesOnUpdate, "d3 and the crashed-but-running d5")
+	require.EqualValues(t, 1, health[updateB].UpdateIssues)
+	require.EqualValues(t, 2, health[updateB].RuntimeIssues)
+	require.EqualValues(t, 1, health[updateB].FailedStillOn, "d5 overlaps; d4 rolled back, d6 moved on")
+	// An update nothing attempted has no entry: zero-valued on read.
+	require.Zero(t, health[updateGhost])
+}
+
+// storedAppVersion reads the column directly: nothing on the read API exposes
+// it, because the only consumer is the outbox resolving an event's dimensions.
+func storedAppVersion(t *testing.T, pool *pgxpool.Pool, appID, deviceID string) *string {
 	t.Helper()
-	u, err := toPgUUID(id)
+	var appVersion *string
+	require.NoError(t, pool.QueryRow(context.Background(),
+		"SELECT app_version FROM device_identity WHERE app_id = $1 AND eas_client_id = $2",
+		appID, deviceID).Scan(&appVersion))
+	return appVersion
+}
+
+// A device that takes an update while offline then flushes the telemetry it
+// recorded BEFORE the switch: that batch and the manifest poll announcing the
+// new update race, and the older observation must not win however late it
+// lands. Losing this guard does not just show a stale update in the registry,
+// it fires the outbox trigger a second time and writes a 'switched' event back
+// to the update the device already left, which is permanent.
+func TestTouchDeviceRefusesAnOlderObservation(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	oldUpdate, newUpdate := uuid.NewString(), uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, oldUpdate)
+	seedPublishedUpdate(t, pool, appID, newUpdate)
+	deviceID := uuid.NewString()
+
+	// The manifest poll lands first: the device is on the new update.
+	now := time.Now().UTC()
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil,
+		&CurrentUpdate{ID: newUpdate, ObservedAt: now}, DeviceInfo{}))
+
+	// The backlog arrives after, carrying what the device ran ten minutes ago.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil,
+		&CurrentUpdate{ID: oldUpdate, ObservedAt: now.Add(-10 * time.Minute)}, DeviceInfo{Model: "iPhone18,2"}))
+
+	device, err := store.GetDevice(ctx, appID, deviceID)
 	require.NoError(t, err)
-	return u
+	require.NotNil(t, device.CurrentUpdateID)
+	require.Equal(t, newUpdate, *device.CurrentUpdateID, "a stale observation must not walk the registry backwards")
+	// The whole write is refused, hardware included: an observation older than
+	// the one on file describes a device we already know more about.
+	require.Nil(t, device.DeviceModel)
+
+	// One adoption event, not two: no spurious switch back to the old update.
+	var events int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT count(*) FROM device_health_outbox WHERE app_id = $1 AND eas_client_id = $2",
+		appID, deviceID).Scan(&events))
+	require.Equal(t, 1, events)
+
+	// A fresher observation still moves it, so the guard is a floor and not a
+	// freeze.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil,
+		&CurrentUpdate{ID: oldUpdate, ObservedAt: now.Add(time.Minute)}, DeviceInfo{}))
+	moved, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.Equal(t, oldUpdate, *moved.CurrentUpdateID)
+}
+
+// A check-in that names no update says nothing about which one runs, so it has
+// nothing to be stale about and must always bump last_seen.
+func TestTouchDeviceWithoutUpdateIsNeverRefused(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	updateID := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, updateID)
+	deviceID := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, observed(updateID), DeviceInfo{}))
+
+	before, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{Model: "SM-A536B"}))
+
+	after, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.True(t, after.LastSeenAt.After(before.LastSeenAt) || after.LastSeenAt.Equal(before.LastSeenAt))
+	require.NotNil(t, after.DeviceModel)
+	require.Equal(t, "SM-A536B", *after.DeviceModel)
+	require.Equal(t, updateID, *after.CurrentUpdateID)
+}
+
+// Hardware and store version reach the registry through telemetry only, so the
+// columns have to survive every manifest poll that follows, and an upgrade of
+// either has to land.
+func TestTouchDeviceHardwareCoalesce(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	deviceID := uuid.NewString()
+	reported := DeviceInfo{Model: "iPhone18,2", OSName: "iOS", OSVersion: "26.1", AppVersion: "1.4.0"}
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, reported))
+
+	registered, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.NotNil(t, registered.DeviceModel)
+	require.Equal(t, "iPhone18,2", *registered.DeviceModel)
+	require.Equal(t, "iOS", *registered.OSName)
+	require.Equal(t, "26.1", *registered.OSVersion)
+	require.Equal(t, "1.4.0", *storedAppVersion(t, pool, appID, deviceID))
+
+	// A manifest poll knows no hardware and must leave it untouched.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+	kept, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.NotNil(t, kept.DeviceModel)
+	require.Equal(t, "iPhone18,2", *kept.DeviceModel)
+	require.Equal(t, "26.1", *kept.OSVersion)
+	require.Equal(t, "1.4.0", *storedAppVersion(t, pool, appID, deviceID))
+
+	// A real OS upgrade does land, and so does a store release.
+	upgraded := reported
+	upgraded.OSVersion = "26.2"
+	upgraded.AppVersion = "1.5.0"
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, upgraded))
+	after, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.Equal(t, "26.2", *after.OSVersion)
+	require.Equal(t, "1.5.0", *storedAppVersion(t, pool, appID, deviceID))
+}
+
+// The same must hold on the registration arm, where the row does not exist yet
+// and the upsert's ON CONFLICT is what writes.
+func TestRegisterDeviceKeepsHardwareOnConflict(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	deviceID := uuid.NewString()
+	// First contact ever carries no hardware (a manifest poll), so the row is
+	// created empty and the first telemetry batch has to fill it.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, nil, DeviceInfo{
+		Model: "SM-A536B", OSName: "Android", OSVersion: "14",
+	}))
+
+	device, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.NotNil(t, device.DeviceModel)
+	require.Equal(t, "SM-A536B", *device.DeviceModel)
+	require.Equal(t, "Android", *device.OSName)
+}
+
+// The inventory joins the release dimensions from the update each device runs,
+// rather than storing them: an update never changes branch, so there is
+// nothing to keep in sync. The join must be LEFT, or every device on the
+// embedded bundle would vanish from the unfiltered list.
+// A publish produces one update per platform, and a device only ever stores
+// the update it runs. "Devices on this update group" therefore has to reach
+// them through their update, which is what the join is for.
+func TestListDevicesFiltersOnUpdateGroup(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	iosUpdate, androidUpdate, otherUpdate := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	group, otherGroup := uuid.NewString(), uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, iosUpdate)
+	seedGroupedUpdate(t, pool, appID, androidUpdate, group, 2)
+	seedGroupedUpdate(t, pool, appID, otherUpdate, otherGroup, 3)
+	_, err := pool.Exec(ctx, "UPDATE updates SET publish_group = $1 WHERE update_uuid = $2", group, iosUpdate)
+	require.NoError(t, err)
+
+	onIOS, onAndroid, elsewhere := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, onIOS, nil, observed(iosUpdate), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, onAndroid, nil, observed(androidUpdate), DeviceInfo{}))
+	require.NoError(t, store.TouchDevice(ctx, appID, elsewhere, nil, observed(otherUpdate), DeviceInfo{}))
+
+	// Both halves of the publish, and nothing from the other one.
+	devices, _, err := store.ListDevices(ctx, appID, DeviceQuery{UpdateGroupIDs: []string{group}}, 10, nil)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{onIOS, onAndroid}, clientIDs(devices))
+
+	// Several groups compare populations, like every other dimension.
+	both, _, err := store.ListDevices(ctx, appID, DeviceQuery{
+		UpdateGroupIDs: []string{group, otherGroup},
+	}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, both, 3)
+}
+
+func clientIDs(devices []Device) []string {
+	out := make([]string, 0, len(devices))
+	for _, device := range devices {
+		out = append(out, device.EASClientID)
+	}
+	return out
+}
+
+func TestListDevicesReportsReleaseDimensions(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	updateID := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, updateID)
+	branch := "health-" + updateID[:8]
+
+	onUpdate := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, onUpdate, nil, observed(updateID), DeviceInfo{
+		Model: "iPhone18,2", OSName: "iOS", OSVersion: "26.1",
+	}))
+	// A device on the embedded bundle reports an id no published update
+	// matches, so the resolution stores nothing.
+	embedded := uuid.NewString()
+	embeddedUpdate := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, embedded, nil, observed(embeddedUpdate), DeviceInfo{}))
+
+	all, _, err := store.ListDevices(ctx, appID, DeviceQuery{}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, all, 2, "an unknown update must not drop a device from the inventory")
+
+	byBranch, _, err := store.ListDevices(ctx, appID, DeviceQuery{Branches: []string{branch}}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, byBranch, 1)
+	require.Equal(t, onUpdate, byBranch[0].EASClientID)
+	require.NotNil(t, byBranch[0].Branch)
+	require.Equal(t, branch, *byBranch[0].Branch)
+	require.NotNil(t, byBranch[0].Platform)
+	require.Equal(t, "ios", *byBranch[0].Platform)
+	require.NotNil(t, byBranch[0].CurrentUpdateID)
+	require.Equal(t, updateID, *byBranch[0].CurrentUpdateID)
+
+	// Hardware filters hit the registry columns directly.
+	byModel, _, err := store.ListDevices(ctx, appID, DeviceQuery{DeviceModels: []string{"iPhone18,2"}}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, byModel, 1)
+	require.Equal(t, onUpdate, byModel[0].EASClientID)
+
+	byOS, _, err := store.ListDevices(ctx, appID, DeviceQuery{OSNames: []string{"iOS"}, OSVersions: []string{"26.1"}}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, byOS, 1)
+
+	// The embedded-bundle device is listed, with no release dimensions to
+	// report. Looked up by id: the page is ordered by last_seen, not by
+	// insertion.
+	var embeddedRow *Device
+	for i := range all {
+		if all[i].EASClientID == embedded {
+			embeddedRow = &all[i]
+		}
+	}
+	require.NotNil(t, embeddedRow)
+	require.Nil(t, embeddedRow.Branch)
+	require.Nil(t, embeddedRow.RuntimeVersion)
+	require.Nil(t, embeddedRow.Platform)
+}
+
+// current_update_id arrives on the unauthenticated wire, so a device of one app
+// can name an update of another. The release dimensions are resolved once at
+// check-in, scoped to the app, which is where that claim has to be refused: a
+// leak here would put another app's branch, runtime and platform in this app's
+// inventory, and make its releases filterable from the outside.
+func TestDeviceReleaseDimensionsRefuseAnotherAppsUpdate(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	otherAppID := seedApp(t, pool)
+	ctx := context.Background()
+
+	foreignUpdate := uuid.NewString()
+	seedPublishedUpdate(t, pool, otherAppID, foreignUpdate)
+	foreignBranch := "health-" + foreignUpdate[:8]
+
+	claimant := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, claimant, nil, observed(foreignUpdate), DeviceInfo{}))
+
+	// The device is still registered: an unattributable update is not a reason
+	// to lose the install.
+	all, _, err := store.ListDevices(ctx, appID, DeviceQuery{}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	require.Equal(t, claimant, all[0].EASClientID)
+	require.Nil(t, all[0].Branch, "another app's branch must not reach this inventory")
+	require.Nil(t, all[0].RuntimeVersion)
+	require.Nil(t, all[0].Platform)
+
+	// And the other app's release is not filterable from here.
+	byForeign, _, err := store.ListDevices(ctx, appID, DeviceQuery{Branches: []string{foreignBranch}}, 10, nil)
+	require.NoError(t, err)
+	require.Empty(t, byForeign)
+
+	count, err := store.CountOnlineDevices(ctx, appID, time.Now().Add(-time.Hour), DeviceQuery{
+		Branches: []string{foreignBranch},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, count)
+
+	// Nor is the id itself kept. The header is unauthenticated, so storing it
+	// raw put an update this app never published into an analytical column,
+	// and the outbox trigger fires on every change of it: alternating invented
+	// ids would mint one permanent adoption event per request.
+	device, err := store.GetDevice(ctx, appID, claimant)
+	require.NoError(t, err)
+	require.Nil(t, device.CurrentUpdateID)
+
+	var events int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT count(*) FROM device_health_outbox WHERE app_id = $1 AND eas_client_id = $2",
+		appID, claimant).Scan(&events))
+	require.Zero(t, events, "an update the server never published is not an adoption")
+}
+
+// Same refusal for an id that resolves to nothing at all, which is what a
+// device back on its embedded bundle reports: the bundle's own id matches no
+// updates row. It reads as "on no known update" rather than naming a bundle
+// the server never published, and publishing an update is what fills it in.
+func TestDeviceCurrentUpdateRefusesAnUnknownID(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	real := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, real)
+	deviceID := uuid.NewString()
+
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, observed(real), DeviceInfo{}))
+	onReal, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.NotNil(t, onReal.CurrentUpdateID)
+	require.Equal(t, real, *onReal.CurrentUpdateID)
+
+	// Back on the embedded bundle: the id it reports is its own, not a row.
+	require.NoError(t, store.TouchDevice(ctx, appID, deviceID, nil, observed(uuid.NewString()), DeviceInfo{}))
+	after, err := store.GetDevice(ctx, appID, deviceID)
+	require.NoError(t, err)
+	require.Nil(t, after.CurrentUpdateID, "an unknown id must not linger, and must not be stored either")
+	require.Nil(t, after.Branch)
+
+	// One adoption event, for the real update. Leaving it is not an adoption,
+	// and neither is coming back to something the server cannot name.
+	var events int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT count(*) FROM device_health_outbox WHERE app_id = $1 AND eas_client_id = $2",
+		appID, deviceID).Scan(&events))
+	require.Equal(t, 1, events)
+}
+
+// The online count sits next to filtered figures, so it narrows on the same
+// dimensions as the inventory. Two things it must not do: drop a device the
+// registry knows nothing more about, and treat "no release filter" as "every
+// update of the app", which is the same thing said the other way round.
+func TestCountOnlineDevicesFilters(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	first, second := uuid.NewString(), uuid.NewString()
+	group := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, first)
+	seedGroupedUpdate(t, pool, appID, second, group, 2)
+	firstBranch, secondBranch := "health-"+first[:8], "group-"+second[:8]
+
+	onFirst, onSecond, embedded := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, onFirst, nil, observed(first), DeviceInfo{Model: "iPhone18,2"}))
+	require.NoError(t, store.TouchDevice(ctx, appID, onSecond, nil, observed(second), DeviceInfo{Model: "SM-A546B"}))
+	// Reports an update no publish matches, so it joins to nothing.
+	unknownUpdate := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, embedded, nil, observed(unknownUpdate), DeviceInfo{}))
+
+	since := time.Now().UTC().Add(-DefaultOnlineWindow)
+	all, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{})
+	require.NoError(t, err)
+	require.EqualValues(t, 3, all, "a device on an unknown update must still count as online")
+
+	byBranch, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{Branches: []string{firstBranch}})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, byBranch)
+
+	bothBranches, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{
+		Branches: []string{firstBranch, secondBranch},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, bothBranches)
+
+	// The other arms of the same subquery: seedPublishedUpdate is ios, the
+	// grouped one android.
+	byPlatform, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{Platforms: []string{"android"}})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, byPlatform)
+
+	byGroup, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{UpdateGroupIDs: []string{group}})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, byGroup)
+
+	// A branch nobody runs is zero, not the whole fleet: the release filter
+	// resolving to nothing must not read as "no release filter".
+	none, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{Branches: []string{"no-such-branch"}})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, none)
+
+	// Filters combine, they do not widen: this device is on the first branch,
+	// so asking for it on the second one's model is zero.
+	crossed, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{
+		Branches:     []string{firstBranch},
+		DeviceModels: []string{"SM-A546B"},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, crossed)
+
+	byModel, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{DeviceModels: []string{"SM-A546B"}})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, byModel)
+
+	// The window still cuts first: a device that went quiet is out whatever the
+	// filters say.
+	_, err = pool.Exec(ctx,
+		"UPDATE device_identity SET last_seen_at = now() - interval '2 hours' WHERE app_id = $1 AND eas_client_id = $2",
+		appID, onFirst)
+	require.NoError(t, err)
+	stale, err := store.CountOnlineDevices(ctx, appID, since, DeviceQuery{Branches: []string{firstBranch}})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, stale)
+}
+
+// Several values per filter is what makes a comparison possible: two branches
+// side by side rather than one query each.
+func TestListDevicesAcceptsSeveralValues(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	first := uuid.NewString()
+	second := uuid.NewString()
+	seedPublishedUpdate(t, pool, appID, first)
+	seedPublishedUpdate(t, pool, appID, second)
+
+	onFirst := uuid.NewString()
+	onSecond := uuid.NewString()
+	require.NoError(t, store.TouchDevice(ctx, appID, onFirst, nil, observed(first), DeviceInfo{Model: "iPhone18,2"}))
+	require.NoError(t, store.TouchDevice(ctx, appID, onSecond, nil, observed(second), DeviceInfo{Model: "SM-A546B"}))
+
+	both, _, err := store.ListDevices(ctx, appID, DeviceQuery{
+		Branches: []string{"health-" + first[:8], "health-" + second[:8]},
+	}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, both, 2)
+
+	// A model identifier carries a comma, and the array predicate treats it as
+	// one value rather than two.
+	models, _, err := store.ListDevices(ctx, appID, DeviceQuery{
+		DeviceModels: []string{"iPhone18,2", "SM-A546B"},
+	}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, models, 2)
+
+	single, _, err := store.ListDevices(ctx, appID, DeviceQuery{
+		DeviceModels: []string{"iPhone18,2"},
+	}, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, single, 1)
+	require.Equal(t, onFirst, single[0].EASClientID)
+}
+
+// The stats of a whole mutation settle in two statements, whatever its size.
+// This used to be three per key executed one at a time, so a hundred-key
+// mutation cost three hundred sequential round trips with the transaction and
+// its row locks held throughout.
+//
+// What the batching must not change is the arithmetic, so this walks a wide
+// mutation through a full move: every key set, then every key changed at once.
+func TestApplySetCountsAWideMutation(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+
+	const keyCount = 60
+	first := map[string]any{}
+	second := map[string]any{}
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		declareKey(t, store, appID, key, ValueTypeString)
+		first[key] = "before"
+		second[key] = "after"
+	}
+
+	clientID := uuid.NewString()
+	_, err := store.ApplySet(ctx, appID, clientID, first, nil)
+	require.NoError(t, err)
+	for i := 0; i < keyCount; i++ {
+		values, err := store.SearchMetadataValues(ctx, appID, fmt.Sprintf("k%02d", i), "", 10)
+		require.NoError(t, err)
+		require.Equal(t, []ValueCount{{Value: "before", DeviceCount: 1}}, values)
+	}
+
+	// Sixty decrements and sixty increments in one ordered statement.
+	_, err = store.ApplySet(ctx, appID, clientID, second, nil)
+	require.NoError(t, err)
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		values, err := store.SearchMetadataValues(ctx, appID, key, "", 10)
+		require.NoError(t, err)
+		require.Equal(t, []ValueCount{{Value: "after", DeviceCount: 1}}, values,
+			"%s: the emptied value must be pruned, not left at zero", key)
+	}
+
+	// Two devices on the same value count twice, which is the whole point of
+	// the table: the autocomplete ranks by how many devices carry a value.
+	other := uuid.NewString()
+	_, err = store.ApplySet(ctx, appID, other, map[string]any{"k00": "after"}, nil)
+	require.NoError(t, err)
+	values, err := store.SearchMetadataValues(ctx, appID, "k00", "", 10)
+	require.NoError(t, err)
+	require.Equal(t, []ValueCount{{Value: "after", DeviceCount: 2}}, values)
+}
+
+// seedLineage publishes n updates on ONE branch, runtime and platform, in
+// order, and returns their uuids oldest first. seedPublishedUpdate gives each
+// update its own branch, which is the opposite of what resolution needs: the
+// rule turns entirely on whether two updates belong to the same line and which
+// of them is later.
+func seedLineage(t *testing.T, pool *pgxpool.Pool, appID string, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	suffix := uuid.NewString()[:8]
+	var branchID, runtimeVersionID int64
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO branches (app_id, name) VALUES ($1, $2) RETURNING id",
+		appID, "line-"+suffix).Scan(&branchID))
+	require.NoError(t, pool.QueryRow(ctx,
+		"INSERT INTO runtime_versions (app_id, version) VALUES ($1, $2) RETURNING id",
+		appID, "line-"+suffix).Scan(&runtimeVersionID))
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		updateID := uuid.NewString()
+		_, err := pool.Exec(ctx, `
+			INSERT INTO updates
+				(id, update_uuid, branch_id, runtime_version_id, update_type, commit_hash, platform, checked_at)
+			SELECT COALESCE(MAX(id), 0) + 1, $1, $2, $3, 0, 'line-test', 'ios', CURRENT_TIMESTAMP FROM updates`,
+			updateID, branchID, runtimeVersionID)
+		require.NoError(t, err)
+		ids = append(ids, updateID)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM branches WHERE id = $1", branchID)
+		_, _ = pool.Exec(context.Background(), "DELETE FROM runtime_versions WHERE id = $1", runtimeVersionID)
+	})
+	return ids
+}
+
+func failureResolved(t *testing.T, pool *pgxpool.Pool, appID, deviceID, updateID string, failureType FailureType) bool {
+	t.Helper()
+	var resolved *time.Time
+	require.NoError(t, pool.QueryRow(context.Background(), `
+		SELECT resolved_at FROM device_update_failures
+		WHERE app_id = $1 AND eas_client_id = $2 AND update_id = $3 AND failure_type = $4`,
+		appID, deviceID, updateID, string(failureType)).Scan(&resolved))
+	return resolved != nil
+}
+
+// A manifest failure had no way to close. The recovery signal the runtime path
+// uses is a successful JS startup, and an update that fails to launch natively
+// never produces one, so the row stayed open forever and its update read 0%
+// health long after the fleet had moved on.
+//
+// What closes it is where the device went next, and the DIRECTION is the whole
+// rule: forward means recovered, backward is the rollback itself.
+func TestMovingForwardResolvesAFailureAndRollingBackDoesNot(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	line := seedLineage(t, pool, appID, 3)
+	older, failed, newer := line[0], line[1], line[2]
+
+	stuck, moved := uuid.NewString(), uuid.NewString()
+	later := time.Now().UTC().Add(time.Minute)
+
+	for _, device := range []string{stuck, moved} {
+		require.NoError(t, store.TouchDevice(ctx, appID, device, nil, nil, DeviceInfo{}))
+		require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{failed}, "boom", FailureTypeUpdate))
+	}
+
+	// The rollback: expo-updates could not launch it, so the device is back on
+	// the previous release. It is still stuck on this failure.
+	require.NoError(t, store.TouchDevice(ctx, appID, stuck, nil,
+		&CurrentUpdate{ID: older, ObservedAt: later}, DeviceInfo{}))
+	require.False(t, failureResolved(t, pool, appID, stuck, failed, FailureTypeUpdate),
+		"a device that rolled BACK is exactly the device still suffering from this update")
+
+	// The fix ships and the device takes it.
+	require.NoError(t, store.TouchDevice(ctx, appID, moved, nil,
+		&CurrentUpdate{ID: newer, ObservedAt: later}, DeviceInfo{}))
+	require.True(t, failureResolved(t, pool, appID, moved, failed, FailureTypeUpdate),
+		"a device that moved past the update is no longer failing on it")
+
+	// And the resolution has to reach ClickHouse, or the projected history
+	// keeps counting a device the live state stopped counting.
+	var recovered int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM device_health_outbox
+		WHERE app_id = $1 AND eas_client_id = $2 AND update_id = $3 AND event_type = 'recovered'`,
+		appID, moved, failed).Scan(&recovered))
+	require.Equal(t, 1, recovered, "resolving must enqueue the recovery for the projection")
+}
+
+// Running the update again clears a manifest failure, because it means the
+// update launched after all. It must NOT clear a runtime failure: there,
+// running the update is the failing state, since the device launches it and
+// then crashes in JS. Clearing on that signal would wipe every JS crash on the
+// device's next manifest poll.
+func TestRunningTheUpdateClearsAManifestFailureButNotAJSCrash(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	line := seedLineage(t, pool, appID, 1)
+	update := line[0]
+	device := uuid.NewString()
+	later := time.Now().UTC().Add(time.Minute)
+
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{update}, "boom", FailureTypeUpdate))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{update}, "TypeError", FailureTypeRuntime))
+
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil,
+		&CurrentUpdate{ID: update, ObservedAt: later}, DeviceInfo{}))
+
+	require.True(t, failureResolved(t, pool, appID, device, update, FailureTypeUpdate),
+		"the update it could not launch is the update it is now running")
+	require.False(t, failureResolved(t, pool, appID, device, update, FailureTypeRuntime),
+		"a device crashing in JS reports this update as current on every poll")
+}
+
+// Resolution follows one line of releases. Another branch, another runtime or
+// another platform is another lineage, and a higher id there says nothing
+// about this device's update.
+func TestMovingForwardOnAnotherLineageResolvesNothing(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	failed := seedLineage(t, pool, appID, 1)[0]
+	elsewhere := seedLineage(t, pool, appID, 1)[0] // published after, other branch
+	device := uuid.NewString()
+
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{failed}, "boom", FailureTypeUpdate))
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil,
+		&CurrentUpdate{ID: elsewhere, ObservedAt: time.Now().UTC().Add(time.Minute)}, DeviceInfo{}))
+
+	require.False(t, failureResolved(t, pool, appID, device, failed, FailureTypeUpdate),
+		"a newer update on another branch does not mean this one was fixed")
+}
+
+// The poll that reports a fresh failure also reports what the device is
+// running. That must not close the failure it just opened.
+func TestAFailureReportedByTheSamePollStaysOpen(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	line := seedLineage(t, pool, appID, 2)
+	failed, older := line[1], line[0]
+	device := uuid.NewString()
+
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{failed}, "boom", FailureTypeUpdate))
+	// Same instant, which is what a single poll looks like: the strict
+	// comparison on last_seen_at makes the failure win the tie.
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil,
+		&CurrentUpdate{ID: older, ObservedAt: time.Now().UTC().Add(-time.Minute)}, DeviceInfo{}))
+	require.False(t, failureResolved(t, pool, appID, device, failed, FailureTypeUpdate))
+}
+
+// The case that made the whole rule inert. expo-updates keeps listing a failed
+// update in Expo-Recent-Failed-Update-IDs for a while after the fact, so every
+// poll re-records the failure and stamps last_seen_at with the database clock,
+// which runs AFTER the request timestamp the resolution compares against. A
+// guard requiring last_seen_at < observed_at was therefore false on every poll,
+// for exactly the devices that had already moved on and needed clearing.
+func TestAStickyFailureReportDoesNotBlockResolutionAfterMovingOn(t *testing.T) {
+	store, pool := setupIdentityStore(t)
+	appID := seedApp(t, pool)
+	ctx := context.Background()
+	line := seedLineage(t, pool, appID, 2)
+	failed, newer := line[0], line[1]
+	device := uuid.NewString()
+
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil, nil, DeviceInfo{}))
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{failed}, "boom", FailureTypeUpdate))
+
+	// The device is on the fix now, and its poll STILL carries the old failed
+	// id, re-stamping last_seen_at after the instant the poll was received.
+	pollInstant := time.Now().UTC()
+	require.NoError(t, store.RecordUpdateFailures(ctx, appID, device, []string{failed}, "", FailureTypeUpdate))
+	require.NoError(t, store.TouchDevice(ctx, appID, device, nil,
+		&CurrentUpdate{ID: newer, ObservedAt: pollInstant}, DeviceInfo{}))
+
+	require.True(t, failureResolved(t, pool, appID, device, failed, FailureTypeUpdate),
+		"a device that has moved past the update is clear, whatever its poll keeps repeating")
 }

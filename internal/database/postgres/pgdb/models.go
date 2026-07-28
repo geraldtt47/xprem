@@ -84,16 +84,58 @@ type ChannelRollout struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type DeviceHealthOutbox struct {
+	ID               int64              `json:"id"`
+	EventType        string             `json:"event_type"`
+	AppID            pgtype.UUID        `json:"app_id"`
+	EasClientID      pgtype.UUID        `json:"eas_client_id"`
+	UpdateID         pgtype.UUID        `json:"update_id"`
+	PreviousUpdateID pgtype.UUID        `json:"previous_update_id"`
+	FailureType      *string            `json:"failure_type"`
+	FatalError       string             `json:"fatal_error"`
+	OccurredAt       pgtype.Timestamptz `json:"occurred_at"`
+}
+
 type DeviceIdentity struct {
+	AppID                   pgtype.UUID        `json:"app_id"`
+	EasClientID             pgtype.UUID        `json:"eas_client_id"`
+	Metadata                []byte             `json:"metadata"`
+	CountryCode             *string            `json:"country_code"`
+	City                    *string            `json:"city"`
+	Lat                     *float64           `json:"lat"`
+	Lng                     *float64           `json:"lng"`
+	FirstSeenAt             pgtype.Timestamptz `json:"first_seen_at"`
+	LastSeenAt              pgtype.Timestamptz `json:"last_seen_at"`
+	CurrentUpdateID         pgtype.UUID        `json:"current_update_id"`
+	DeviceModel             *string            `json:"device_model"`
+	OsName                  *string            `json:"os_name"`
+	OsVersion               *string            `json:"os_version"`
+	BranchName              *string            `json:"branch_name"`
+	RuntimeVersion          *string            `json:"runtime_version"`
+	Platform                *string            `json:"platform"`
+	PublishGroup            pgtype.UUID        `json:"publish_group"`
+	AppVersion              *string            `json:"app_version"`
+	CurrentUpdateObservedAt pgtype.Timestamptz `json:"current_update_observed_at"`
+	CurrentUpdateArrivedAt  pgtype.Timestamptz `json:"current_update_arrived_at"`
+}
+
+type DeviceUpdateFailure struct {
 	AppID       pgtype.UUID        `json:"app_id"`
 	EasClientID pgtype.UUID        `json:"eas_client_id"`
-	Metadata    []byte             `json:"metadata"`
-	CountryCode *string            `json:"country_code"`
-	City        *string            `json:"city"`
-	Lat         *float64           `json:"lat"`
-	Lng         *float64           `json:"lng"`
+	UpdateID    pgtype.UUID        `json:"update_id"`
+	FailureType string             `json:"failure_type"`
+	FatalError  string             `json:"fatal_error"`
 	FirstSeenAt pgtype.Timestamptz `json:"first_seen_at"`
 	LastSeenAt  pgtype.Timestamptz `json:"last_seen_at"`
+	ResolvedAt  pgtype.Timestamptz `json:"resolved_at"`
+}
+
+type DeviceUpdateRuntimeState struct {
+	AppID         pgtype.UUID        `json:"app_id"`
+	EasClientID   pgtype.UUID        `json:"eas_client_id"`
+	UpdateID      pgtype.UUID        `json:"update_id"`
+	LastStartedAt pgtype.Timestamptz `json:"last_started_at"`
+	LastCrashedAt pgtype.Timestamptz `json:"last_crashed_at"`
 }
 
 type EnterpriseLicense struct {
