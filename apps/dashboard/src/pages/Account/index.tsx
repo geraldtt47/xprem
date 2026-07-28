@@ -31,13 +31,22 @@ export const Account = () => {
     if (!canSubmit) return;
     setIsSubmitting(true);
     try {
-      await api.changeMyPassword({ currentPassword, newPassword });
+      const stillSignedIn = await api.changeMyPassword({ currentPassword, newPassword });
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
+      if (!stillSignedIn) {
+        // The password changed, but no replacement session came back: every
+        // session the account held is gone, this tab included. A full
+        // navigation rather than a router transition, for the reason endSession
+        // gives in lib/api.ts: the state held above the router never re-reads
+        // the cleared tokens, and would keep issuing unauthenticated requests.
+        window.location.assign('/login');
+        return;
+      }
       toast({
         title: 'Password updated',
-        description: 'Use your new password the next time you sign in.',
+        description: 'Your other sessions have been signed out.',
       });
     } catch (error) {
       toast({ ...describeApiError(error, 'Error updating password'), variant: 'destructive' });

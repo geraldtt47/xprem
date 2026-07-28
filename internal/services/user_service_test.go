@@ -71,12 +71,17 @@ func (r *fakeUserRepo) DeleteUserByID(_ context.Context, id string) error {
 	return nil
 }
 
+// The three writes below mirror what the SQL does in one statement: they
+// retire the account's sessions along with the change, on the losing direction
+// only for the two flags. A fake that skipped the bump would let every
+// revocation test pass on the enabled/is_admin re-read alone.
 func (r *fakeUserRepo) UpdateUserPassword(_ context.Context, id string, passwordHash string) error {
 	user, ok := r.users[id]
 	if !ok {
 		return &store.ErrResourceNotFound{Resource: "user", Identifier: id}
 	}
 	user.PasswordHash = passwordHash
+	user.SessionVersion++
 	r.users[id] = user
 	return nil
 }
@@ -88,6 +93,9 @@ func (r *fakeUserRepo) UpdateUserIsAdmin(_ context.Context, id string, isAdmin b
 	}
 	if user.IsAdmin && !isAdmin && r.adminCount() <= 1 {
 		return store.ErrWouldLeaveNoAdmin
+	}
+	if user.IsAdmin && !isAdmin {
+		user.SessionVersion++
 	}
 	user.IsAdmin = isAdmin
 	r.users[id] = user
@@ -102,7 +110,20 @@ func (r *fakeUserRepo) UpdateUserEnabled(_ context.Context, id string, enabled b
 	if user.IsAdmin && user.Enabled && !enabled && r.adminCount() <= 1 {
 		return store.ErrWouldLeaveNoAdmin
 	}
+	if user.Enabled && !enabled {
+		user.SessionVersion++
+	}
 	user.Enabled = enabled
+	r.users[id] = user
+	return nil
+}
+
+func (r *fakeUserRepo) BumpUserSessionVersion(_ context.Context, id string) error {
+	user, ok := r.users[id]
+	if !ok {
+		return &store.ErrResourceNotFound{Resource: "user", Identifier: id}
+	}
+	user.SessionVersion++
 	r.users[id] = user
 	return nil
 }
@@ -293,7 +314,7 @@ func TestDashboardAuthServiceWithUserRepo(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	repo := newFakeUserRepo()
 	userService := NewUserService(repo)
-	authService := NewDashboardAuthService(repo)
+	authService := NewDashboardAuthService(repo, newFakeRefreshTokenRepo())
 	ctx := context.Background()
 
 	user, err := userService.CreateUser(ctx, "admin@example.com", "Sup3rSecret!", true)
@@ -350,7 +371,7 @@ func TestStatelessLoginRequiresAdminEmail(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	t.Setenv("ADMIN_EMAIL", "")
 	t.Setenv("ADMIN_PASSWORD", "admin")
-	authService := NewDashboardAuthService(nil)
+	authService := NewDashboardAuthService(nil, nil)
 
 	_, err := authService.LoginWithEmailPassword(context.Background(), "admin@example.com", "admin")
 	assert.True(t, errors.Is(err, ErrAdminEmailNotSet))

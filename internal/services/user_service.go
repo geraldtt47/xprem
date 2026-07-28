@@ -24,9 +24,18 @@ type UserRepository interface {
 	// (store.ErrWouldLeaveNoAdmin): a check-then-write at this level would race
 	// with concurrent demotions/deletions/disables.
 	DeleteUserByID(ctx context.Context, id string) error
+	// The three writes below also retire the account's sessions, in the same
+	// statement, whenever the change is one its live sessions must not survive:
+	// always for a new password, and on the losing direction only for the two
+	// flags. Doing it in the statement is what makes the revocation impossible
+	// to skip on a stale read or lose to a failure between two calls.
 	UpdateUserPassword(ctx context.Context, id string, passwordHash string) error
 	UpdateUserIsAdmin(ctx context.Context, id string, isAdmin bool) error
 	UpdateUserEnabled(ctx context.Context, id string, enabled bool) error
+	// BumpUserSessionVersion retires them on their own, with no other change to
+	// the account. Only the replay response needs that: it has proof a
+	// credential leaked, and nothing about the row itself is wrong.
+	BumpUserSessionVersion(ctx context.Context, id string) error
 	TouchUserLastConnected(ctx context.Context, id string) error
 }
 
@@ -273,6 +282,9 @@ func (s *UserService) ChangePassword(ctx context.Context, userId string, current
 	if err != nil {
 		return err
 	}
+	// The store retires every session of the account in the same statement, so
+	// the new password and the death of the sessions minted under the old one
+	// either both land or neither does.
 	if err := s.userRepo.UpdateUserPassword(ctx, userId, passwordHash); err != nil {
 		return err
 	}

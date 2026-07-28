@@ -530,19 +530,35 @@ WHERE users.id = $1
   AND (users.id NOT IN (SELECT id FROM admins) OR (SELECT COUNT(*) FROM admins) > 1);
 
 -- name: UpdateUserPasswordByID :execresult
+-- The session version moves with the password, in the same statement. A second
+-- call could fail after this one committed, which would leave the sessions
+-- minted under the old password alive behind the new one. Nothing else retires
+-- them: the account stays enabled and keeps its admin flag, so the version is
+-- the only thing that ends those sessions.
 UPDATE users
-SET password_hash = $2, updated_at = CURRENT_TIMESTAMP
+SET password_hash = $2,
+    session_version = session_version + 1,
+    updated_at = CURRENT_TIMESTAMP
 WHERE id = $1;
 
 -- name: UpdateUserIsAdminByID :execresult
 -- Same admin-row lock as DeleteUserByID: demoting the last remaining admin
 -- matches no row. Promotions ($2 true) always pass the guard but still take
 -- the lock, so they serialize with concurrent demotions.
+--
+-- Losing the admin flag also ends the account's sessions, in this statement so
+-- that the revocation cannot be skipped by a stale read or lost to a failure
+-- between two calls. The CASE reads users.is_admin, which in a SET expression
+-- is the value BEFORE the update: the version therefore moves only on a real
+-- demotion, never on a promotion and never on an idempotent PATCH.
 WITH admins AS (
     SELECT id FROM users WHERE is_admin AND enabled ORDER BY id FOR UPDATE
 )
 UPDATE users
-SET is_admin = $2, updated_at = CURRENT_TIMESTAMP
+SET is_admin = $2,
+    session_version = session_version
+        + CASE WHEN users.is_admin AND NOT $2::boolean THEN 1 ELSE 0 END,
+    updated_at = CURRENT_TIMESTAMP
 WHERE users.id = $1
   AND ($2::boolean
        OR users.id NOT IN (SELECT id FROM admins)
@@ -553,15 +569,68 @@ WHERE users.id = $1
 -- admin matches no row, so approving/revoking accounts can never lock the
 -- dashboard out. Enabling ($2 true) always passes the guard but still takes
 -- the lock, so it serializes with concurrent disables.
+--
+-- Losing access also ends the account's sessions, same reasoning and same
+-- shape as UpdateUserIsAdminByID: the version moves only when an enabled
+-- account is being disabled, so approving one never signs anybody out.
 WITH admins AS (
     SELECT id FROM users WHERE is_admin AND enabled ORDER BY id FOR UPDATE
 )
 UPDATE users
-SET enabled = $2, updated_at = CURRENT_TIMESTAMP
+SET enabled = $2,
+    session_version = session_version
+        + CASE WHEN users.enabled AND NOT $2::boolean THEN 1 ELSE 0 END,
+    updated_at = CURRENT_TIMESTAMP
 WHERE users.id = $1
   AND ($2::boolean
        OR users.id NOT IN (SELECT id FROM admins)
        OR (SELECT COUNT(*) FROM admins) > 1);
+
+-- name: BumpUserSessionVersion :execresult
+-- Invalidates every token the account holds at once: both the per-request
+-- check and the refresh path compare the JWT's sv claim to this column.
+UPDATE users
+SET session_version = session_version + 1, updated_at = CURRENT_TIMESTAMP
+WHERE id = $1;
+
+-- name: InsertRefreshToken :exec
+INSERT INTO refresh_tokens (id, user_id, family_id, expires_at)
+VALUES ($1, $2, $3, $4);
+
+-- name: ConsumeRefreshToken :one
+-- Single-use claim, atomic on purpose: two requests presenting the same token
+-- concurrently must not both succeed, or rotation would hand out two live
+-- successors and replay detection would never fire. The loser gets no row and
+-- goes look at why (see GetRefreshToken).
+UPDATE refresh_tokens
+SET used_at = CURRENT_TIMESTAMP, replaced_by = sqlc.arg(replaced_by)
+WHERE id = sqlc.arg(id)
+  AND used_at IS NULL
+  AND expires_at > CURRENT_TIMESTAMP
+RETURNING *;
+
+-- name: GetRefreshToken :one
+-- used_recently answers "was this token rotated within the replay grace" using
+-- the DATABASE clock on both sides. Comparing used_at (stamped by
+-- CURRENT_TIMESTAMP) against the application's clock would straddle two
+-- machines: a database running ahead would make the window always true and
+-- silently disable replay detection, one running behind would read every
+-- legitimate concurrent refresh as a replay.
+SELECT *,
+       (used_at IS NOT NULL AND used_at > CURRENT_TIMESTAMP - sqlc.arg(replay_grace)::interval) AS used_recently
+FROM refresh_tokens
+WHERE id = sqlc.arg(id);
+
+-- name: DeleteRefreshTokenFamily :exec
+DELETE FROM refresh_tokens
+WHERE family_id = $1;
+
+-- name: DeleteExpiredRefreshTokensForUser :exec
+-- Runs whenever the account is issued a token, which bounds the table to the
+-- live tokens of accounts that still sign in, without a background job.
+DELETE FROM refresh_tokens
+WHERE user_id = $1
+  AND expires_at <= CURRENT_TIMESTAMP;
 
 -- name: MigrateLegacyApp :exec
 INSERT INTO apps (
