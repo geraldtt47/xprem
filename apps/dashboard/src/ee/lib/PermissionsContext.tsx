@@ -22,6 +22,7 @@ export type Permission =
   | 'channel:edit-branch'
   | 'channel-rollout:manage'
   | 'update-rollout:manage'
+  | 'update:publish'
   | 'apikeys:manage'
   | 'identity:manage'
   | 'identity:read'

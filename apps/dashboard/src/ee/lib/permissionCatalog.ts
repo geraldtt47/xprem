@@ -94,6 +94,17 @@ export const PERMISSION_GROUPS: PermissionGroup[] = [
     ],
   },
   {
+    label: 'Updates',
+    permissions: [
+      {
+        value: 'update:publish',
+        label: 'Republish and roll back',
+        description:
+          'Put a past update back at the head of its branch, or send a branch back to the bundle embedded in the app. Both change what every device runs at its next update check.',
+      },
+    ],
+  },
+  {
     label: 'API tokens',
     permissions: [
       {

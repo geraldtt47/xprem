@@ -311,7 +311,7 @@ func InitDependencies(ctx context.Context) (*AppContainer, func()) {
 		RolloutHandler:              dashhandlers.NewRolloutHandler(rolloutService, updateService),
 		SettingsHandler:             dashhandlers.NewSettingsHandler(appService, ssoService.Enabled, visibleApps),
 		SSOHandler:                  sso.NewSSOHandler(ssoService),
-		UpdateHandler:               dashhandlers.NewUpdateHandler(updateService),
+		UpdateHandler:               dashhandlers.NewUpdateHandler(updateService, deploymentService),
 		UploadHandler:               handlers.NewUploadHandler(cliAuthService, deploymentService),
 		UsersHandler:                dashhandlers.NewUsersHandler(userService),
 		UserRepo:                    userRepo,

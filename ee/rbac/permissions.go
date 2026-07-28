@@ -68,6 +68,16 @@ const (
 	// a device dimension reads device_model, os_version and country_code, so
 	// the handler asks for this permission before answering.
 	PermObserveRead Permission = "observe:read"
+	// PermUpdatePublish republishes a past update and rolls a branch back to
+	// the embedded bundle from the dashboard. Both change what every device on
+	// the branch runs at the next update check, which is why one permission
+	// covers them: being able to put an update back in front of the fleet and
+	// being able to take one away are the same level of trust.
+	//
+	// Deliberately NOT covered by PermUpdateRolloutManage: reverting a rollout
+	// acts on a publish someone is already watching, while this acts on any
+	// update in the history.
+	PermUpdatePublish Permission = "update:publish"
 )
 
 // AllPermissions is the catalog, in the order the dashboard displays it.
@@ -83,6 +93,7 @@ var AllPermissions = []Permission{
 	PermChannelEditBranch,
 	PermChannelRolloutManage,
 	PermUpdateRolloutManage,
+	PermUpdatePublish,
 	PermApiKeysManage,
 	PermIdentityManage,
 	PermIdentityRead,
