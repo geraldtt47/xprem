@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"expo-open-ota/internal/helpers"
 	"expo-open-ota/internal/services"
 	types2 "expo-open-ota/internal/types"
 	"log"
@@ -14,13 +13,11 @@ import (
 )
 
 type RepublishHandler struct {
-	cliAuthService    *services.CliAuthService
 	deploymentService *services.DeploymentService
 }
 
-func NewRepublishHandler(cliAuthService *services.CliAuthService, deploymentService *services.DeploymentService) *RepublishHandler {
+func NewRepublishHandler(deploymentService *services.DeploymentService) *RepublishHandler {
 	return &RepublishHandler{
-		cliAuthService:    cliAuthService,
 		deploymentService: deploymentService,
 	}
 }
@@ -57,14 +54,6 @@ func (h *RepublishHandler) HandleRepublish(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "No branch provided", http.StatusBadRequest)
 		return
 	}
-	auth := helpers.GetAuth(r)
-	credential, err := h.cliAuthService.ValidateCliCredential(r.Context(), appId, auth, branchName, helpers.ClientIP(r))
-	if err != nil {
-		log.Printf("[RequestID: %s] Error validating auth: %v", requestID, err)
-		RenderCliAuthError(w, err)
-		return
-	}
-	r = r.WithContext(services.WithCliAuth(r.Context(), credential))
 	runtimeVersion := r.URL.Query().Get("runtimeVersion")
 	if runtimeVersion == "" {
 		log.Printf("[RequestID: %s] No runtime version provided", requestID)
