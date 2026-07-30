@@ -164,6 +164,32 @@ func (q *Queries) ClearUpdateRollout(ctx context.Context, arg ClearUpdateRollout
 	return result.RowsAffected(), nil
 }
 
+const consumeOAuthAuthorizationCode = `-- name: ConsumeOAuthAuthorizationCode :one
+UPDATE oauth_authorization_codes
+SET used_at = CURRENT_TIMESTAMP
+WHERE id = $1 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+RETURNING id, client_id, user_id, redirect_uri, code_challenge, scope, created_at, expires_at, used_at
+`
+
+// Single-use claim, atomic on purpose: two exchanges presenting the same code
+// concurrently must not both succeed. The loser gets no row.
+func (q *Queries) ConsumeOAuthAuthorizationCode(ctx context.Context, id pgtype.UUID) (OauthAuthorizationCode, error) {
+	row := q.db.QueryRow(ctx, consumeOAuthAuthorizationCode, id)
+	var i OauthAuthorizationCode
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.UserID,
+		&i.RedirectUri,
+		&i.CodeChallenge,
+		&i.Scope,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.UsedAt,
+	)
+	return i, err
+}
+
 const consumeRefreshToken = `-- name: ConsumeRefreshToken :one
 UPDATE refresh_tokens
 SET used_at = CURRENT_TIMESTAMP, replaced_by = $1
@@ -526,6 +552,15 @@ DELETE FROM enterprise_license
 
 func (q *Queries) DeleteEnterpriseLicense(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, deleteEnterpriseLicense)
+	return err
+}
+
+const deleteExpiredOAuthAuthorizationCodes = `-- name: DeleteExpiredOAuthAuthorizationCodes :exec
+DELETE FROM oauth_authorization_codes WHERE expires_at < CURRENT_TIMESTAMP
+`
+
+func (q *Queries) DeleteExpiredOAuthAuthorizationCodes(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, deleteExpiredOAuthAuthorizationCodes)
 	return err
 }
 
@@ -1610,6 +1645,22 @@ func (q *Queries) GetLatestUpdateWithRollout(ctx context.Context, arg GetLatestU
 	return i, err
 }
 
+const getOAuthClient = `-- name: GetOAuthClient :one
+SELECT id, name, redirect_uris, created_at FROM oauth_clients WHERE id = $1
+`
+
+func (q *Queries) GetOAuthClient(ctx context.Context, id pgtype.UUID) (OauthClient, error) {
+	row := q.db.QueryRow(ctx, getOAuthClient, id)
+	var i OauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.RedirectUris,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getRefreshToken = `-- name: GetRefreshToken :one
 SELECT id, user_id, family_id, created_at, expires_at, used_at, replaced_by,
        (used_at IS NOT NULL AND used_at > CURRENT_TIMESTAMP - $1::interval) AS used_recently
@@ -2661,6 +2712,50 @@ func (q *Queries) InsertChannelRollout(ctx context.Context, arg InsertChannelRol
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const insertOAuthAuthorizationCode = `-- name: InsertOAuthAuthorizationCode :exec
+INSERT INTO oauth_authorization_codes (id, client_id, user_id, redirect_uri, code_challenge, scope, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+`
+
+type InsertOAuthAuthorizationCodeParams struct {
+	ID            pgtype.UUID        `json:"id"`
+	ClientID      pgtype.UUID        `json:"client_id"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	RedirectUri   string             `json:"redirect_uri"`
+	CodeChallenge string             `json:"code_challenge"`
+	Scope         string             `json:"scope"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) InsertOAuthAuthorizationCode(ctx context.Context, arg InsertOAuthAuthorizationCodeParams) error {
+	_, err := q.db.Exec(ctx, insertOAuthAuthorizationCode,
+		arg.ID,
+		arg.ClientID,
+		arg.UserID,
+		arg.RedirectUri,
+		arg.CodeChallenge,
+		arg.Scope,
+		arg.ExpiresAt,
+	)
+	return err
+}
+
+const insertOAuthClient = `-- name: InsertOAuthClient :exec
+INSERT INTO oauth_clients (id, name, redirect_uris)
+VALUES ($1, $2, $3)
+`
+
+type InsertOAuthClientParams struct {
+	ID           pgtype.UUID `json:"id"`
+	Name         string      `json:"name"`
+	RedirectUris []string    `json:"redirect_uris"`
+}
+
+func (q *Queries) InsertOAuthClient(ctx context.Context, arg InsertOAuthClientParams) error {
+	_, err := q.db.Exec(ctx, insertOAuthClient, arg.ID, arg.Name, arg.RedirectUris)
+	return err
 }
 
 const insertRefreshToken = `-- name: InsertRefreshToken :exec
