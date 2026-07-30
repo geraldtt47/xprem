@@ -8,6 +8,7 @@ import (
 	"expo-open-ota/ee/branchprotection"
 	"expo-open-ota/ee/identity"
 	"expo-open-ota/ee/licensing"
+	eemcptools "expo-open-ota/ee/mcptools"
 	"expo-open-ota/ee/observe"
 	"expo-open-ota/ee/rbac"
 	"expo-open-ota/ee/sso"
@@ -20,6 +21,7 @@ import (
 	"expo-open-ota/internal/handlers"
 	dashhandlers "expo-open-ota/internal/handlers/dashboard"
 	"expo-open-ota/internal/mcp"
+	"expo-open-ota/internal/mcptools"
 	"expo-open-ota/internal/oauth"
 	"expo-open-ota/internal/ratelimit"
 	"expo-open-ota/internal/services"
@@ -140,7 +142,6 @@ func InitDependencies(ctx context.Context) (*AppContainer, func()) {
 		refreshTokenRepo = store.NewPostgresRefreshTokenStore(dbEngine)
 		oauthClientRepo = store.NewPostgresOAuthClientStore(dbEngine)
 		oauthCodeRepo = store.NewPostgresOAuthCodeStore(dbEngine)
-		mcpHandler = mcp.NewMCPHandler(mcp.NewMCPService())
 		licenseRepo = licensing.NewPostgresLicenseStore(dbEngine)
 		ssoRepo = sso.NewPostgresSSOStore(dbEngine)
 		apiKeyAccessRepo = apikeyrestrictions.NewPostgresApiKeyAccessStore(dbEngine)
@@ -255,6 +256,38 @@ func InitDependencies(ctx context.Context) (*AppContainer, func()) {
 	if oauthClientRepo != nil {
 		oauthService = oauth.NewOAuthService(oauthClientRepo, oauthCodeRepo, refreshTokenRepo, userRepo)
 		oauthHandler = oauth.NewOAuthHandler(oauthService, rateLimiter)
+
+		rbac.MustValidateMCPTools(mcptools.DeclaredPermissions(), eemcptools.DeclaredPermissions())
+		mcpHandler = mcp.NewMCPHandler(mcp.NewMCPService(
+			mcptools.Configurator(mcptools.Deps{
+				Apps:                appRepo,
+				Branches:            branchService,
+				Channels:            channelService,
+				UpdateFeed:          updateService,
+				UpdateRollouts:      rolloutService,
+				Certificates:        appService,
+				BranchWriter:        branchService,
+				ChannelWriter:       channelService,
+				Deployments:         deploymentService,
+				SSOEnabled:          ssoService.Enabled,
+				VisibleApps:         rbacService.VisibleAppsForPrincipal,
+				CanUseSomewhere:     rbacService.MCPCanUseSomewhere,
+				Authorize:           rbacService.MCPAuthorizeTool,
+				DescribePermissions: rbacService.MCPDescribePermissions,
+			}),
+			eemcptools.Configurator(eemcptools.Deps{
+				CanUseSomewhere: rbacService.MCPCanUseSomewhere,
+				Authorize:       rbacService.MCPAuthorizeTool,
+				Audit:           auditService,
+				Apps:            appRepo,
+				VisibleApps:     rbacService.VisibleAppsForPrincipal,
+				Identity:        identityService,
+				HealthHistory:   healthHistory,
+				StateHistory:    stateHistory,
+				UpdateFeed:      updateService,
+				Explorer:        explorer,
+			}),
+		))
 	}
 
 	container := &AppContainer{
