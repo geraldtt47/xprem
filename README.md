@@ -147,7 +147,7 @@ Applied to a fleet, one update check per app launch: a typical app produces arou
 
 ## Quick start
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/xprem?referralCode=OEHlEK&utm_medium=integration&utm_source=template&utm_campaign=generic)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/expo-open-ota?referralCode=OEHlEK&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
 1. Deploy the server with the Railway button above, Docker or the Helm chart.
 2. Run `npx eoas init` in your Expo project to wire it to your server.
