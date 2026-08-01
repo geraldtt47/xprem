@@ -2,10 +2,10 @@
   <img src=".github/img/cover.png" alt="xprem" />
 </p>
 
-<h3 align="center">Self-hosted OTA updates and control plane for Expo apps</h3>
+<h3 align="center">xprem: Self-hosted OTA updates and control plane for Expo apps</h3>
 
 <p align="center">
-  <sub>Formerly known as <b>Expo Open OTA</b> (expo-open-ota): same project, same maintainers, renamed to respect Expo's trademark.<br/>xprem is not affiliated with, sponsored or endorsed by Expo.</sub>
+  <sub>Formerly known as <b>Expo Open OTA</b> (expo-open-ota): same project, same maintainers, renamed to respect Expo's trademark.
 </p>
 
 <p align="center">
