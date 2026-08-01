@@ -7,13 +7,13 @@ package apikeyrestrictions
 import (
 	"encoding/json"
 	"errors"
-	"expo-open-ota/internal/cache"
-	"expo-open-ota/internal/handlers"
-	"expo-open-ota/internal/validation"
-	"expo-open-ota/internal/version"
 	"fmt"
 	"net/http"
 	"strconv"
+	"xprem/internal/cache"
+	"xprem/internal/handlers"
+	"xprem/internal/validation"
+	"xprem/internal/version"
 
 	"github.com/gorilla/mux"
 )

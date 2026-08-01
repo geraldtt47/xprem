@@ -3,16 +3,16 @@ package services
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/auditlog"
-	"expo-open-ota/internal/bucket"
-	"expo-open-ota/internal/cache"
-	"expo-open-ota/internal/dashboard"
-	"expo-open-ota/internal/database/postgres/pgdb"
-	"expo-open-ota/internal/store"
-	"expo-open-ota/internal/types"
-	"expo-open-ota/internal/validation"
 	"fmt"
 	"strconv"
+	"xprem/internal/auditlog"
+	"xprem/internal/bucket"
+	"xprem/internal/cache"
+	"xprem/internal/dashboard"
+	"xprem/internal/database/postgres/pgdb"
+	"xprem/internal/store"
+	"xprem/internal/types"
+	"xprem/internal/validation"
 )
 
 type BranchService struct {

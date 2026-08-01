@@ -78,7 +78,7 @@ export const OAuthConsent = () => {
               </h1>
               <p className="text-sm text-muted-foreground">
                 <span className="font-medium text-foreground">{clientName}</span> wants to access
-                your Expo Open OTA account.
+                your xprem account.
               </p>
             </div>
           </div>

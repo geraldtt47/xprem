@@ -12,9 +12,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"expo-open-ota/internal/crypto"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/store"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +21,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"xprem/internal/crypto"
+	"xprem/internal/services"
+	"xprem/internal/store"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
@@ -1093,4 +1093,24 @@ func TestPublicConfigAndEnabled(t *testing.T) {
 	service, _ = newTestService(t, repo, users)
 	assert.False(t, service.Enabled(context.Background()))
 	assert.False(t, service.PublicConfig(context.Background()).Enabled)
+}
+
+// The dashboard never reads the client secret back, so an admin can change the
+// issuer without knowing it. Carrying the stored secret over would hand an IdP
+// credential to whatever token endpoint the new issuer advertises.
+func TestSaveConfigRefusesToCarrySecretToANewIssuer(t *testing.T) {
+	idp := newFakeIdP(t)
+	other := newFakeIdP(t)
+	users := newFakeUserRepo()
+	repo := newFakeSSORepo(users, testConfigFor(idp))
+	service, _ := newTestService(t, repo, users)
+
+	_, err := service.SaveConfig(context.Background(), SaveConfigInput{
+		Issuer: other.issuer, ClientID: testClientID, ClientSecret: "", Enabled: true,
+	})
+
+	validationErr := (*ConfigValidationError)(nil)
+	require.ErrorAs(t, err, &validationErr)
+	assert.ErrorContains(t, err, "re-enter the client secret")
+	assert.Equal(t, 0, repo.saveCalls)
 }

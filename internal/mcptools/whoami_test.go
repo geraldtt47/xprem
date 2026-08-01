@@ -3,9 +3,9 @@ package mcptools
 import (
 	"context"
 	"errors"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/services"
 	"testing"
+	"xprem/config"
+	"xprem/internal/services"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"

@@ -1,9 +1,9 @@
 package infrastructure
 
 import (
-	"expo-open-ota/ee/geoip"
-	"expo-open-ota/internal/middleware"
 	"net/http"
+	"xprem/ee/geoip"
+	"xprem/internal/middleware"
 
 	"github.com/gorilla/mux"
 )

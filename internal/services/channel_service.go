@@ -2,14 +2,14 @@ package services
 
 import (
 	"context"
-	"expo-open-ota/internal/auditlog"
-	"expo-open-ota/internal/cache"
-	"expo-open-ota/internal/dashboard"
-	"expo-open-ota/internal/providers/expo"
-	"expo-open-ota/internal/types"
-	"expo-open-ota/internal/validation"
 	"fmt"
 	"strconv"
+	"xprem/internal/auditlog"
+	"xprem/internal/cache"
+	"xprem/internal/dashboard"
+	"xprem/internal/providers/expo"
+	"xprem/internal/types"
+	"xprem/internal/validation"
 )
 
 // invalidateChannelCaches drops the dashboard list caches a channel write

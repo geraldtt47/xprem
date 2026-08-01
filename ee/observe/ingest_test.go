@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"expo-open-ota/ee/identity"
-	"expo-open-ota/internal/database"
-	"expo-open-ota/internal/database/postgres"
-	"expo-open-ota/internal/database/postgres/pgdb"
+	"xprem/ee/identity"
+	"xprem/internal/database"
+	"xprem/internal/database/postgres"
+	"xprem/internal/database/postgres/pgdb"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
@@ -274,7 +274,7 @@ const jsCrashLogsFixture = `{
               "body": { "stringValue": "" },
               "attributes": [
                 { "key": "session.id", "value": { "stringValue": "aaaa-1111" } },
-                { "key": "event.name", "value": { "stringValue": "expo_open_ota_js_crash" } },
+                { "key": "event.name", "value": { "stringValue": "xprem_js_crash" } },
                 { "key": "message", "value": { "stringValue": "TypeError: undefined is not a function" } }
               ]
             },
@@ -285,7 +285,7 @@ const jsCrashLogsFixture = `{
               "body": { "stringValue": "" },
               "attributes": [
                 { "key": "session.id", "value": { "stringValue": "bbbb-2222" } },
-                { "key": "event.name", "value": { "stringValue": "expo_open_ota_js_crash" } }
+                { "key": "event.name", "value": { "stringValue": "xprem_js_crash" } }
               ]
             }
           ]
@@ -308,7 +308,7 @@ const jsCrashLogsFixture = `{
               "severityText": "ERROR",
               "body": { "stringValue": "" },
               "attributes": [
-                { "key": "event.name", "value": { "stringValue": "expo_open_ota_js_crash" } },
+                { "key": "event.name", "value": { "stringValue": "xprem_js_crash" } },
                 { "key": "message", "value": { "stringValue": "embedded bundle crash" } }
               ]
             }
@@ -359,7 +359,7 @@ const runtimeRecoveryLogsFixture = `{
       },
       {
         "timeUnixNano": 1767960489000000000,
-        "attributes": [{"key": "event.name", "value": {"stringValue": "expo_open_ota_js_crash"}}]
+        "attributes": [{"key": "event.name", "value": {"stringValue": "xprem_js_crash"}}]
       }
     ]}]
   }]

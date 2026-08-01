@@ -6,7 +6,7 @@ import (
 	"log"
 	"strings"
 
-	"expo-open-ota/internal/types"
+	"xprem/internal/types"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

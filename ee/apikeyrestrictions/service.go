@@ -7,12 +7,12 @@ package apikeyrestrictions
 import (
 	"context"
 	"errors"
-	"expo-open-ota/ee/licensing"
-	"expo-open-ota/internal/auditlog"
-	"expo-open-ota/internal/services"
 	"fmt"
 	"net/netip"
 	"strconv"
+	"xprem/ee/licensing"
+	"xprem/internal/auditlog"
+	"xprem/internal/services"
 )
 
 // ApiKeyAccess is everything one API key is allowed to do: the branches it

@@ -8,14 +8,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"expo-open-ota/ee/identity"
-	"expo-open-ota/internal/handlers"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"sort"
 	"time"
+	"xprem/ee/identity"
+	"xprem/internal/handlers"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
@@ -343,7 +343,7 @@ func (h *IngestHandler) HandleLogs(w http.ResponseWriter, r *http.Request) {
 // JSCrashEventName is the documented log-event convention for reporting a JS
 // runtime crash into update health.
 const (
-	JSCrashEventName    = "expo_open_ota_js_crash"
+	JSCrashEventName    = "xprem_js_crash"
 	AppStartedEventName = "app_started"
 )
 

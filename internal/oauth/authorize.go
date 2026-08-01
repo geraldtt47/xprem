@@ -3,13 +3,13 @@ package oauth
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/store"
 	"fmt"
 	"log"
 	"net/url"
 	"slices"
 	"time"
+	"xprem/internal/services"
+	"xprem/internal/store"
 
 	"github.com/google/uuid"
 )

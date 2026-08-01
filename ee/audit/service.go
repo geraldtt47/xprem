@@ -7,12 +7,12 @@ package audit
 import (
 	"context"
 	"errors"
-	"expo-open-ota/config"
-	"expo-open-ota/ee/licensing"
-	"expo-open-ota/internal/auditlog"
 	"log"
 	"strconv"
 	"time"
+	"xprem/config"
+	"xprem/ee/licensing"
+	"xprem/internal/auditlog"
 )
 
 // Event, ActorType, Outcome and Action alias the vocabulary defined in internal/auditlog.

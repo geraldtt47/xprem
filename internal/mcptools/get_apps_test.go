@@ -2,9 +2,9 @@ package mcptools
 
 import (
 	"context"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/services"
 	"testing"
+	"xprem/config"
+	"xprem/internal/services"
 )
 
 type multiAppLister struct{}

@@ -8,9 +8,9 @@ package branchprotection
 import (
 	"context"
 	"errors"
-	"expo-open-ota/ee/licensing"
-	"expo-open-ota/internal/auditlog"
-	"expo-open-ota/internal/services"
+	"xprem/ee/licensing"
+	"xprem/internal/auditlog"
+	"xprem/internal/services"
 )
 
 // Repository persists the branch protection flag.

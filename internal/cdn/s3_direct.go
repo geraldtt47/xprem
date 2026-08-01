@@ -2,11 +2,11 @@ package cdn
 
 import (
 	"context"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/bucket"
-	"expo-open-ota/internal/providers/aws"
 	"fmt"
 	"time"
+	"xprem/config"
+	"xprem/internal/bucket"
+	"xprem/internal/providers/aws"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"

@@ -2,14 +2,14 @@ package oauth
 
 import (
 	"context"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/store"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+	"xprem/internal/services"
+	"xprem/internal/store"
 
 	"github.com/google/uuid"
 )

@@ -1,9 +1,9 @@
 package infrastructure
 
 import (
-	"expo-open-ota/ee/apikeyrestrictions"
-	"expo-open-ota/internal/middleware"
 	"net/http"
+	"xprem/ee/apikeyrestrictions"
+	"xprem/internal/middleware"
 
 	"github.com/gorilla/mux"
 )

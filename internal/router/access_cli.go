@@ -1,11 +1,11 @@
 package infrastructure
 
 import (
-	"expo-open-ota/ee/apikeyrestrictions"
-	"expo-open-ota/internal/handlers"
-	"expo-open-ota/internal/helpers"
-	"expo-open-ota/internal/services"
 	"net/http"
+	"xprem/ee/apikeyrestrictions"
+	"xprem/internal/handlers"
+	"xprem/internal/helpers"
+	"xprem/internal/services"
 )
 
 // authorizeCliRequest runs the enterprise access decision for a CLI request,

@@ -6,9 +6,9 @@ package rbac
 
 import (
 	"context"
-	"expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
 	"testing"
+	"xprem/internal/mcptools"
+	"xprem/internal/services"
 
 	"github.com/stretchr/testify/require"
 )

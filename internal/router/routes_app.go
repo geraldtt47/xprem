@@ -1,10 +1,10 @@
 package infrastructure
 
 import (
-	"expo-open-ota/ee/apikeyrestrictions"
-	"expo-open-ota/ee/rbac"
-	"expo-open-ota/internal/middleware"
 	"net/http"
+	"xprem/ee/apikeyrestrictions"
+	"xprem/ee/rbac"
+	"xprem/internal/middleware"
 
 	"github.com/gorilla/mux"
 )

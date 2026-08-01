@@ -4,10 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"expo-open-ota/internal/crypto"
-	"expo-open-ota/internal/store"
 	"testing"
 	"time"
+	"xprem/internal/crypto"
+	"xprem/internal/store"
 
 	"github.com/golang-jwt/jwt/v5"
 )

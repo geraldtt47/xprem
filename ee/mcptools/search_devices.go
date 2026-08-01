@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"expo-open-ota/ee/identity"
-	"expo-open-ota/ee/rbac"
+	"xprem/ee/identity"
+	"xprem/ee/rbac"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

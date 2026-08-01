@@ -7,10 +7,10 @@ package branchprotection
 import (
 	"encoding/json"
 	"errors"
-	"expo-open-ota/internal/cache"
-	"expo-open-ota/internal/dashboard"
-	"expo-open-ota/internal/handlers"
 	"net/http"
+	"xprem/internal/cache"
+	"xprem/internal/dashboard"
+	"xprem/internal/handlers"
 
 	"github.com/gorilla/mux"
 )

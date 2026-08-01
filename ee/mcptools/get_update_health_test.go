@@ -6,10 +6,10 @@ package mcptools
 
 import (
 	"context"
-	"expo-open-ota/config"
-	mittools "expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
 	"testing"
+	"xprem/config"
+	mittools "xprem/internal/mcptools"
+	"xprem/internal/services"
 
 	"github.com/google/uuid"
 )

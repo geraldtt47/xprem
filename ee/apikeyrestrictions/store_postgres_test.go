@@ -9,7 +9,7 @@ import (
 	"reflect"
 	"testing"
 
-	"expo-open-ota/internal/database/postgres/pgdb"
+	"xprem/internal/database/postgres/pgdb"
 )
 
 func pattern(value string) *string { return &value }

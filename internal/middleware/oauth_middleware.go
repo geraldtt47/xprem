@@ -3,9 +3,9 @@ package middleware
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/oauth"
-	"expo-open-ota/internal/services"
 	"net/http"
+	"xprem/internal/oauth"
+	"xprem/internal/services"
 
 	"github.com/gorilla/mux"
 	"github.com/modelcontextprotocol/go-sdk/auth"

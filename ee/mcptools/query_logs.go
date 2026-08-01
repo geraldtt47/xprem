@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"expo-open-ota/ee/observe"
+	"xprem/ee/observe"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

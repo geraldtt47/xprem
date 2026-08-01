@@ -3,10 +3,10 @@ package services
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/auditlog"
-	"expo-open-ota/internal/database/postgres/pgdb"
-	"expo-open-ota/internal/types"
 	"testing"
+	"xprem/internal/auditlog"
+	"xprem/internal/database/postgres/pgdb"
+	"xprem/internal/types"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

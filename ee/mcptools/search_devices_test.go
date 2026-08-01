@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"expo-open-ota/ee/identity"
-	mittools "expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
+	"xprem/ee/identity"
+	mittools "xprem/internal/mcptools"
+	"xprem/internal/services"
 )
 
 // Without a device registry, every device tool says so instead of failing on a

@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"expo-open-ota/ee/audit"
-	mittools "expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
+	"xprem/ee/audit"
+	mittools "xprem/internal/mcptools"
+	"xprem/internal/services"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"

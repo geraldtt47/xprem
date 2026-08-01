@@ -3,13 +3,13 @@ package handlers
 import (
 	"context"
 	"errors"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/types"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
+	"xprem/config"
+	"xprem/internal/services"
+	"xprem/internal/types"
 
 	"github.com/google/uuid"
 )

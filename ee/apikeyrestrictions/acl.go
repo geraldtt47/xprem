@@ -5,9 +5,9 @@
 package apikeyrestrictions
 
 import (
-	"expo-open-ota/internal/validation"
 	"fmt"
 	"strings"
+	"xprem/internal/validation"
 )
 
 // maxBranchRules bounds the number of rules a single API key may hold.

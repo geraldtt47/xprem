@@ -3,11 +3,11 @@ package mcptools
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/store"
-	"expo-open-ota/internal/validation"
 	"log"
 	"strconv"
+	"xprem/internal/services"
+	"xprem/internal/store"
+	"xprem/internal/validation"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

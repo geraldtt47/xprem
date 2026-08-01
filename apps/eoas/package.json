@@ -11,21 +11,22 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "homepage": "https://github.com/mercuretechnologies/expo-open-ota/tree/main/eoas",
+  "homepage": "https://github.com/mercuretechnologies/xprem/tree/main/eoas",
   "keywords": [
-    "expo-open-ota",
+    "xprem",
     "expo",
     "eas",
     "cli"
   ],
   "author": "Axel Marciano",
   "license": "MIT",
-  "description": "A CLI tool to manage publishing and OTA updates for expo-open-OTA self-hosted server. This is not an official tool from Expo but an open-source project (https://github.com/mercuretechnologies/expo-open-ota)",
+  "description": "A CLI tool to manage publishing and OTA updates for the xprem self-hosted server. This is not an official tool from Expo but an open-source project (https://github.com/mercuretechnologies/xprem)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mercuretechnologies/expo-open-ota.git"
+    "url": "git+https://github.com/mercuretechnologies/xprem.git"
   },
   "dependencies": {
+    "@clack/prompts": "^0.11.0",
     "@expo/code-signing-certificates": "^0.0.5",
     "@expo/config": "10.0.11",
     "@expo/config-plugins": "9.0.12",
@@ -52,11 +53,11 @@
     "https-proxy-agent": "5.0.1",
     "ignore": "5.3.0",
     "joi": "17.11.0",
+    "js-yaml": "^5.2.2",
     "jscodeshift": "^17.1.2",
     "log-symbols": "^4.0.0",
     "mime": "3.0.0",
     "node-fetch": "^2.6.7",
-    "ora": "^5.1.0",
     "prettier": "3.1.1",
     "prompts": "^2.4.2",
     "recast": "^0.23.9",
@@ -72,6 +73,7 @@
     "@tsconfig/node18": "^18.2.4",
     "@types/fs-extra": "11.0.4",
     "@types/getenv": "^1.0.0",
+    "@types/js-yaml": "^4.0.9",
     "@types/jscodeshift": "^0.12.0",
     "@types/mime": "^3.0.4",
     "@types/node": "^18.19.74",

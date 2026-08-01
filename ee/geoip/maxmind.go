@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"expo-open-ota/config"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"xprem/config"
 
 	"github.com/oschwald/geoip2-golang"
 )
@@ -84,9 +84,9 @@ func resolveGeoipCacheDir(configured string) string {
 		return configured
 	}
 	if dir, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(dir, "expo-open-ota", "geoip")
+		return filepath.Join(dir, "xprem", "geoip")
 	}
-	return filepath.Join(os.TempDir(), "expo-open-ota-geoip")
+	return filepath.Join(os.TempDir(), "xprem-geoip")
 }
 
 func (r *maxMindResolver) start() {

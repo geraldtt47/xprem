@@ -2,12 +2,12 @@ package infrastructure
 
 import (
 	"context"
-	"expo-open-ota/ee/apikeyrestrictions"
-	"expo-open-ota/ee/rbac"
-	"expo-open-ota/internal/handlers"
-	"expo-open-ota/internal/services"
 	"net/http"
 	"strings"
+	"xprem/ee/apikeyrestrictions"
+	"xprem/ee/rbac"
+	"xprem/internal/handlers"
+	"xprem/internal/services"
 
 	"github.com/gorilla/mux"
 )

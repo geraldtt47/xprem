@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"expo-open-ota/ee/identity"
-	"expo-open-ota/ee/observe"
-	"expo-open-ota/ee/rbac"
-	mittools "expo-open-ota/internal/mcptools"
+	"xprem/ee/identity"
+	"xprem/ee/observe"
+	"xprem/ee/rbac"
+	mittools "xprem/internal/mcptools"
 
 	"github.com/google/uuid"
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"

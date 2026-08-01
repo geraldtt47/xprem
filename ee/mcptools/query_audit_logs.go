@@ -10,8 +10,8 @@ import (
 	"log"
 	"time"
 
-	"expo-open-ota/ee/audit"
-	mittools "expo-open-ota/internal/mcptools"
+	"xprem/ee/audit"
+	mittools "xprem/internal/mcptools"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/store"
-	"expo-open-ota/internal/types"
+	"xprem/internal/services"
+	"xprem/internal/store"
+	"xprem/internal/types"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

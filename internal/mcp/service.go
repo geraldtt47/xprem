@@ -2,10 +2,10 @@ package mcp
 
 import (
 	"context"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/version"
 	"net/http"
 	"time"
+	"xprem/internal/services"
+	"xprem/internal/version"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -27,9 +27,9 @@ func NewMCPService(configurators ...ConfigureServer) *MCPService {
 	// what its principal may use.
 	newSessionServer := func(req *http.Request) *mcpprot.Server {
 		server := mcpprot.NewServer(&mcpprot.Implementation{
-			Name:    "Expo-Open-Ota",
+			Name:    "xprem",
 			Version: version.Version,
-			Title:   "Expo Open OTA",
+			Title:   "xprem",
 		}, &mcpprot.ServerOptions{SchemaCache: schemas})
 		principal := services.PrincipalFromContext(req.Context())
 		for _, configure := range configurators {

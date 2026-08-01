@@ -3,12 +3,12 @@ package mcptools
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/validation"
 	"log"
 	"strings"
 	"time"
+	"xprem/internal/validation"
 
-	"expo-open-ota/internal/types"
+	"xprem/internal/types"
 
 	"github.com/google/uuid"
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"

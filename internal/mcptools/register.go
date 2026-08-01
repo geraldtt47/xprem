@@ -2,9 +2,9 @@ package mcptools
 
 import (
 	"context"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/types"
+	"xprem/config"
+	"xprem/internal/services"
+	"xprem/internal/types"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

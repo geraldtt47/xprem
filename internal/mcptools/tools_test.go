@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/types"
+	"xprem/internal/services"
+	"xprem/internal/types"
 )
 
 type fakeReadServices struct{}

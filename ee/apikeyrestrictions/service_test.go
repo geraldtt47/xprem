@@ -7,13 +7,13 @@ package apikeyrestrictions
 import (
 	"context"
 	"errors"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/validation"
 	"fmt"
 	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
+	"xprem/internal/services"
+	"xprem/internal/validation"
 )
 
 type fakeAccessRepo struct {

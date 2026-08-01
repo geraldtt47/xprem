@@ -1,9 +1,9 @@
 package infrastructure
 
 import (
-	"expo-open-ota/internal/middleware"
-	"expo-open-ota/internal/oauth"
 	"net/http"
+	"xprem/internal/middleware"
+	"xprem/internal/oauth"
 
 	"github.com/gorilla/mux"
 )

@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"expo-open-ota/internal/update"
+	"xprem/internal/update"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

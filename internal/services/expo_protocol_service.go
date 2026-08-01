@@ -4,21 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/assets"
-	cdn2 "expo-open-ota/internal/cdn"
-	"expo-open-ota/internal/crypto"
-	"expo-open-ota/internal/keyStore"
-	"expo-open-ota/internal/metrics"
-	"expo-open-ota/internal/providers/expo"
-	"expo-open-ota/internal/types"
-	update2 "expo-open-ota/internal/update"
 	"fmt"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"strconv"
 	"time"
+	"xprem/config"
+	"xprem/internal/assets"
+	cdn2 "xprem/internal/cdn"
+	"xprem/internal/crypto"
+	"xprem/internal/keyStore"
+	"xprem/internal/metrics"
+	"xprem/internal/providers/expo"
+	"xprem/internal/types"
+	update2 "xprem/internal/update"
 )
 
 type ExpoProtocolService struct {
@@ -54,13 +54,12 @@ type ExpoProtocolError struct {
 }
 
 type AssetResolutionParams struct {
-	RequestID             string
-	AppID                 string
-	ChannelName           string
-	AssetName             string
-	RuntimeVersion        string
-	Platform              string
-	PreventCDNRedirection bool
+	RequestID      string
+	AppID          string
+	ChannelName    string
+	AssetName      string
+	RuntimeVersion string
+	Platform       string
 	// ClientID is the device's EAS-Client-ID header.
 	ClientID string
 	// Branch and UpdateID are the query params baked into manifest asset URLs; when
@@ -360,7 +359,7 @@ func (s *ExpoProtocolService) ResolveAssetBundle(ctx context.Context, params Ass
 
 	cdn := cdn2.GetCDN()
 
-	if cdn == nil || params.PreventCDNRedirection {
+	if cdn == nil {
 		resp, err := assets.HandleAssetsWithFile(req)
 		if err != nil {
 			return nil, &ExpoAssetError{StatusCode: http.StatusInternalServerError, Message: "Internal Server Error"}

@@ -9,9 +9,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
-
-	"expo-open-ota/ee/geoip"
-	"expo-open-ota/ee/licensing"
+	"xprem/ee/geoip"
+	"xprem/ee/licensing"
 )
 
 // Op is one identity operation as carried on the wire (the log event name): $set merges,
@@ -184,7 +183,7 @@ func (s *Service) TouchDevice(ctx context.Context, appID string, easClientID str
 }
 
 // RecordUpdateFailures is the failure sink for both sources: manifest error recovery and
-// expo_open_ota_js_crash events.
+// xprem_js_crash events.
 func (s *Service) RecordUpdateFailures(ctx context.Context, appID string, easClientID string, updateIDs []string, fatalError string, failureType FailureType) error {
 	return s.store.RecordUpdateFailures(ctx, appID, easClientID, updateIDs, fatalError, failureType)
 }

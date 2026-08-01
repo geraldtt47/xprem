@@ -15,7 +15,7 @@ import { ensurePrivateKeyIgnored, isValidUpdateUrl } from '../lib/utils';
 
 export default class Init extends Command {
   static override args = {};
-  static override description = 'Configure your existing expo project with Expo Open OTA';
+  static override description = 'Configure your existing expo project with xprem';
   static override examples = ['<%= config.bin %> <%= command.id %>'];
   static override flags = {};
   public async run(): Promise<void> {
@@ -37,7 +37,7 @@ export default class Init extends Command {
     const { appId } = await promptAsync({
       message:
         'Enter the project id for this project (sent as the expo-app-id header).\n' +
-        '  See https://mercure-technologies.gitbook.io/expo-open-ota/stateless-mode/getting-started for details.',
+        '  See https://mercure-technologies.gitbook.io/xprem/stateless-mode/getting-started for details.',
       name: 'appId',
       type: 'text',
       initial: detectedAppId,

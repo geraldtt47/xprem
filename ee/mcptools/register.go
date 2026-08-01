@@ -6,11 +6,11 @@ package mcptools
 
 import (
 	"context"
-	"expo-open-ota/ee/audit"
-	"expo-open-ota/ee/identity"
-	"expo-open-ota/ee/observe"
-	mittools "expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
+	"xprem/ee/audit"
+	"xprem/ee/identity"
+	"xprem/ee/observe"
+	mittools "xprem/internal/mcptools"
+	"xprem/internal/services"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

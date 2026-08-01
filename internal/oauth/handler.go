@@ -3,15 +3,15 @@ package oauth
 import (
 	"encoding/json"
 	"errors"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/handlers"
-	"expo-open-ota/internal/helpers"
-	"expo-open-ota/internal/ratelimit"
-	"expo-open-ota/internal/services"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+	"xprem/config"
+	"xprem/internal/handlers"
+	"xprem/internal/helpers"
+	"xprem/internal/ratelimit"
+	"xprem/internal/services"
 )
 
 // consentPath is the dashboard route the authorize endpoint bounces to; the
@@ -21,6 +21,9 @@ const consentPath = "/dashboard/oauth/consent"
 // The single coarse scope this server issues; finer scopes wait until the MCP
 // server exposes tools worth splitting over.
 const ScopeMCP = "mcp"
+
+// maxTokenRequestBody bounds the grant form.
+const maxTokenRequestBody = 32 * 1024
 
 type OAuthHandler struct {
 	service *OAuthService
@@ -226,6 +229,7 @@ func (h *OAuthHandler) TokenHandler(w http.ResponseWriter, r *http.Request) {
 		handlers.RenderThrottled(w, decision.RetryAfter)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxTokenRequestBody)
 	if err := r.ParseForm(); err != nil {
 		renderTokenError(w, "invalid_request", "request body is not a valid form")
 		return

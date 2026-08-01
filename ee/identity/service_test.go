@@ -7,11 +7,10 @@ package identity
 import (
 	"context"
 	"testing"
+	"xprem/ee/geoip"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
-
-	"expo-open-ota/ee/geoip"
 )
 
 // fakeMutator records the exact call the service dispatched, geo included.
@@ -150,4 +149,3 @@ func TestCustomAttributesRequireALicense(t *testing.T) {
 		require.Equal(t, []string{"plan"}, mutator.keys)
 	})
 }
-

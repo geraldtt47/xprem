@@ -18,7 +18,7 @@ func TestRedisSentinelModeRendersRedisAuthAndTLSEnvVars(t *testing.T) {
 	cmd := exec.Command(
 		"helm",
 		"template",
-		"expo-open-ota",
+		"xprem",
 		".",
 		"--set-string",
 		"cacheMode=redis-sentinel",
@@ -75,7 +75,7 @@ func TestControlPlaneModeStillRendersLegacyFlatEnvVars(t *testing.T) {
 	cmd := exec.Command(
 		"helm",
 		"template",
-		"expo-open-ota",
+		"xprem",
 		".",
 		"--set-string",
 		"controlPlane=true",
@@ -119,6 +119,12 @@ func TestControlPlaneModeStillRendersLegacyFlatEnvVars(t *testing.T) {
 		t.Fatal("expected DB_URL to be required in control-plane mode")
 	}
 
+	for _, name := range []string{"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME"} {
+		if !secretKeyRefOptional(env[name]) {
+			t.Fatalf("expected %s to be an optional secret key ref in control-plane mode", name)
+		}
+	}
+
 	// Key vars of the non-selected storage modes stay hidden.
 	for _, name := range []string{
 		"PUBLIC_LOCAL_EXPO_KEY_PATH",
@@ -137,7 +143,7 @@ func TestStatelessModeRequiresFlatEnvVars(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 
-	cmd := exec.Command("helm", "template", "expo-open-ota", ".")
+	cmd := exec.Command("helm", "template", "xprem", ".")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -163,7 +169,7 @@ func TestOptionalTuningVarsAreRendered(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 
-	cmd := exec.Command("helm", "template", "expo-open-ota", ".")
+	cmd := exec.Command("helm", "template", "xprem", ".")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -177,9 +183,22 @@ func TestOptionalTuningVarsAreRendered(t *testing.T) {
 		"AWS_BASE_ENDPOINT",
 		"AWS_S3_FORCE_PATH_STYLE",
 		"SKIP_LEGACY_APP_ID_FALLBACK",
+		"CACHE_KEY_PREFIX",
+		"DISABLE_S3_DIRECT_CDN",
+		"BUCKET_MIGRATION_CONCURRENCY",
+		"CLICKHOUSE_URL",
+		"GEOIP_MMDB_PATH",
+		"DISABLE_DEVICE_TELEMETRY",
 	} {
 		if !secretKeyRefOptional(env[name]) {
 			t.Fatalf("expected %s to be rendered as an optional secret key ref", name)
+		}
+	}
+
+	// The pool tuning pair only exists in control-plane mode.
+	for _, name := range []string{"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME"} {
+		if _, ok := env[name]; ok {
+			t.Fatalf("did not expect %s with controlPlane=false", name)
 		}
 	}
 }
@@ -192,7 +211,7 @@ func TestGenericCDNVarsRenderOptionalUnderToggle(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 
-	cmd := exec.Command("helm", "template", "expo-open-ota", ".")
+	cmd := exec.Command("helm", "template", "xprem", ".")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -204,7 +223,7 @@ func TestGenericCDNVarsRenderOptionalUnderToggle(t *testing.T) {
 		}
 	}
 
-	cmd = exec.Command("helm", "template", "expo-open-ota", ".", "--set", "useGenericCDN=true")
+	cmd = exec.Command("helm", "template", "xprem", ".", "--set", "useGenericCDN=true")
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -224,7 +243,7 @@ func TestAzureStorageVarsRenderUnderAzureMode(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 
-	cmd := exec.Command("helm", "template", "expo-open-ota", ".")
+	cmd := exec.Command("helm", "template", "xprem", ".")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -236,7 +255,7 @@ func TestAzureStorageVarsRenderUnderAzureMode(t *testing.T) {
 		}
 	}
 
-	cmd = exec.Command("helm", "template", "expo-open-ota", ".", "--set", "storageMode=azure")
+	cmd = exec.Command("helm", "template", "xprem", ".", "--set", "storageMode=azure")
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -267,7 +286,7 @@ func TestProbePaths(t *testing.T) {
 		t.Skip("helm is not installed")
 	}
 
-	cmd := exec.Command("helm", "template", "expo-open-ota", ".")
+	cmd := exec.Command("helm", "template", "xprem", ".")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
@@ -282,6 +301,73 @@ func TestProbePaths(t *testing.T) {
 	if readiness["path"] != "/ready" {
 		t.Fatalf("expected readinessProbe on /ready, got %v", readiness["path"])
 	}
+}
+
+// setting secretEnv makes the chart deploy the secretName Secret itself and
+// stamp its checksum on the pods so a value change re-rolls them.
+func TestSecretEnvRendersSecretAndChecksumAnnotation(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	cmd := exec.Command("helm", "template", "xprem", ".")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\n%s", err, out)
+	}
+	if doc := manifestOfKind(t, out, "Secret"); doc != nil {
+		t.Fatalf("did not expect a Secret to be rendered without secretEnv, got %#v", doc)
+	}
+
+	cmd = exec.Command(
+		"helm",
+		"template",
+		"xprem",
+		".",
+		"--set-string",
+		"secretEnv.JWT_SECRET=test-jwt",
+	)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\n%s", err, out)
+	}
+
+	secret := manifestOfKind(t, out, "Secret")
+	if secret == nil {
+		t.Fatal("expected a Secret to be rendered with secretEnv set")
+	}
+	if name := asMap(t, secret["metadata"])["name"]; name != "xprem-secrets" {
+		t.Fatalf("expected the Secret to be named xprem-secrets, got %v", name)
+	}
+	if value := asMap(t, secret["stringData"])["JWT_SECRET"]; value != "test-jwt" {
+		t.Fatalf("expected stringData JWT_SECRET=test-jwt, got %v", value)
+	}
+
+	deployment := manifestOfKind(t, out, "Deployment")
+	annotations := asMap(t, asMap(t, asMap(t, asMap(t, deployment["spec"])["template"])["metadata"])["annotations"])
+	if _, ok := annotations["checksum/secret-env"]; !ok {
+		t.Fatal("expected the pod template to carry the checksum/secret-env annotation")
+	}
+}
+
+func manifestOfKind(t *testing.T, manifest []byte, kind string) map[string]any {
+	t.Helper()
+
+	decoder := yaml.NewDecoder(bytes.NewReader(manifest))
+	for {
+		var doc map[string]any
+		err := decoder.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("failed to decode manifest: %v", err)
+		}
+		if doc["kind"] == kind {
+			return doc
+		}
+	}
+	return nil
 }
 
 func deploymentContainer(t *testing.T, manifest []byte) map[string]any {

@@ -10,9 +10,9 @@ import (
 	"log"
 	"time"
 
-	"expo-open-ota/ee/observe"
-	mittools "expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/types"
+	"xprem/ee/observe"
+	mittools "xprem/internal/mcptools"
+	"xprem/internal/types"
 
 	"slices"
 

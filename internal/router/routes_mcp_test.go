@@ -1,12 +1,12 @@
 package infrastructure
 
 import (
-	"expo-open-ota/internal/mcp"
-	"expo-open-ota/internal/oauth"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"xprem/internal/mcp"
+	"xprem/internal/oauth"
 
 	"github.com/gorilla/mux"
 )

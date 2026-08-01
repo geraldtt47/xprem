@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"expo-open-ota/internal/database/postgres/pgtest"
+	"xprem/internal/database/postgres/pgtest"
 )
 
 // pgtest serializes these tests since they share TEST_DATABASE_URL with other packages.

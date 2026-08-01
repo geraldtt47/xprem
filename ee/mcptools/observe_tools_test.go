@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"expo-open-ota/ee/observe"
-	"expo-open-ota/ee/rbac"
-	mittools "expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
+	"xprem/ee/observe"
+	"xprem/ee/rbac"
+	mittools "xprem/internal/mcptools"
+	"xprem/internal/services"
 )
 
 // Without telemetry every explorer tool says so, rather than dereferencing a

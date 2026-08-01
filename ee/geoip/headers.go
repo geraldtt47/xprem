@@ -11,8 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
-
-	"expo-open-ota/config"
+	"xprem/config"
 )
 
 // headerNames maps one provider's visitor-location headers.

@@ -2,16 +2,16 @@ package main
 
 import (
 	"context"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/bucketmigration"
-	"expo-open-ota/internal/metrics"
-	infrastructure "expo-open-ota/internal/router"
 	"log"
 	"net/http"
 	"sync/atomic"
 	"time"
+	"xprem/config"
+	"xprem/internal/bucketmigration"
+	"xprem/internal/metrics"
+	infrastructure "xprem/internal/router"
 
-	_ "expo-open-ota/internal/bucketmigrations"
+	_ "xprem/internal/bucketmigrations"
 )
 
 func init() {

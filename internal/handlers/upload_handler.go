@@ -3,14 +3,14 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/bucket"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/validation"
 	"fmt"
 	"log"
 	"net/http"
 	"path/filepath"
+	"xprem/config"
+	"xprem/internal/bucket"
+	"xprem/internal/services"
+	"xprem/internal/validation"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"

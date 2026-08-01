@@ -3,10 +3,6 @@ package test
 import (
 	"bytes"
 	"compress/gzip"
-	"expo-open-ota/internal/assets"
-	"expo-open-ota/internal/cdn"
-	"expo-open-ota/internal/types"
-	"expo-open-ota/internal/update"
 	"github.com/andybalholm/brotli"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
@@ -17,6 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"xprem/internal/assets"
+	"xprem/internal/cdn"
+	"xprem/internal/types"
+	"xprem/internal/update"
 )
 
 func TestEmptyAssetNameForAssets(t *testing.T) {
@@ -468,7 +468,9 @@ func TestUnlistedAssetRejectedOnBothPaths(t *testing.T) {
 	assert.Equal(t, 404, fileResponse.StatusCode)
 }
 
-func TestPreventCDNRedirectionHeader(t *testing.T) {
+// The header used to let any client turn the CDN off and make the origin serve
+// the bytes itself.
+func TestCDNRedirectionCannotBeTurnedOffByAHeader(t *testing.T) {
 	teardown := setup(t)
 	defer teardown()
 	projectRoot, _ := findProjectRoot()
@@ -489,5 +491,5 @@ func TestPreventCDNRedirectionHeader(t *testing.T) {
 
 	testContainer().ExpoProtocolHandler.HandleAssets(w, r)
 
-	assert.Equal(t, 200, w.Code, "Expected status code 200")
+	assert.Equal(t, 302, w.Code, "the CDN redirect must happen despite the header")
 }

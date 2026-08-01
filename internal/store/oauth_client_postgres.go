@@ -2,9 +2,9 @@ package store
 
 import (
 	"context"
-	"expo-open-ota/internal/database"
-	"expo-open-ota/internal/database/postgres/pgdb"
 	"fmt"
+	"xprem/internal/database"
+	"xprem/internal/database/postgres/pgdb"
 )
 
 // OAuthClient is a dynamically registered OAuth client: a public client

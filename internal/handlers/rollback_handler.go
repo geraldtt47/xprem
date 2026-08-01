@@ -3,9 +3,9 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"expo-open-ota/internal/services"
 	"log"
 	"net/http"
+	"xprem/internal/services"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"

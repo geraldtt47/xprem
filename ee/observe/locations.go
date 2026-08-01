@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"expo-open-ota/internal/database/postgres/pgdb"
+	"xprem/internal/database/postgres/pgdb"
 )
 
 // CheckInQuery narrows a check-in read; unlike ExplorerQuery it carries no telemetry dimensions.

@@ -1,11 +1,11 @@
-# Default values for expo-open-ota.
+# Default values for xprem.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
 replicaCount: 1 # Do not use more than 1 replica if storageMode is set to local
 
 image:
-  repository: ghcr.io/mercuretechnologies/expo-open-ota
+  repository: ghcr.io/mercuretechnologies/xprem
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -21,9 +21,16 @@ serviceAccount:
     # eks.amazonaws.com/role-arn: "arn:aws:iam::..."
   # The name of the service account to use.
   # If not set and create is true, a name is generated using the fullname template
-  name: "expo-open-ota-sa"
+  name: "xprem-sa"
 
-secretName: "expo-open-ota-secrets" # If set, environment variables will be read from this secret, else they will be read from the values.yaml file or passed in via the helm command line
+secretName: "xprem-secrets" # If set, environment variables will be read from this secret, else they will be read from the values.yaml file or passed in via the helm command line
+
+# Environment values the chart itself turns into the secretName Secret. Leave
+# empty to manage that Secret out of band (kubectl, external-secrets...).
+# `eoas server:init` generates a secrets.yaml overlay holding this map; deploy
+# with `-f values.yaml -f secrets.yaml`. Changing a value re-rolls the pods
+# through the checksum/secret-env pod annotation.
+secretEnv: {}
 storageMode: "s3"
 keysStorageType: "aws-secrets-manager"
 useCloudfrontRedirect: "false"
@@ -57,7 +64,7 @@ archiveAuditLogs: "false"
 # flat-env app. Requires DB_URL and exactly one control-plane master key (see
 # the env vars below). When "false" the server is single-app (stateless) and
 # the flat EXPO_APP_ID / EXPO_ACCESS_TOKEN / key vars are used.
-# See https://github.com/mercuretechnologies/expo-open-ota/blob/main/apps/docs/docs/advanced/multi-app.mdx
+# See https://github.com/mercuretechnologies/xprem/blob/main/apps/docs/docs/advanced/multi-app.mdx
 controlPlane: "false"
 # Where the DB keys master key comes from when controlPlane="true": "environment"
 # renders DB_KEYS_MASTER_KEY_B64, "aws-secrets-manager" renders
@@ -143,6 +150,11 @@ environment:
           - "redis-sentinel"
       - key: "useRedisTLS"
         is: "true"
+  # Optional prefix on every cache key, for a Redis shared with other apps.
+  - name: "CACHE_KEY_PREFIX"
+    value: ""
+    enabled: true
+    required: false
   - name: "STORAGE_MODE"
     key: "storageMode"
     required: true
@@ -210,12 +222,25 @@ environment:
     required:
       - key: "storageMode"
         is: "s3"
+  # Set to "true" to stop redirecting asset requests to presigned S3 URLs and
+  # keep streaming assets through the server, for buckets on an endpoint the
+  # devices cannot reach (a MinIO on a private network).
+  - name: "DISABLE_S3_DIRECT_CDN"
+    value: ""
+    enabled: true
+    required: false
   - name: "BUCKET_KEY_PREFIX"
     value: ""
     enabled: true
     required: false
   # TODO: remove S3_KEY_PREFIX once users have migrated to BUCKET_KEY_PREFIX
   - name: "S3_KEY_PREFIX"
+    value: ""
+    enabled: true
+    required: false
+  # Parallelism of the one-shot v2 bucket re-path on remote backends
+  # (default 16).
+  - name: "BUCKET_MIGRATION_CONCURRENCY"
     value: ""
     enabled: true
     required: false
@@ -466,6 +491,31 @@ environment:
     required:
       - key: "controlPlane"
         is: "true"
+  - name: "DB_MAX_CONN_LIFETIME"
+    value: ""
+    required: false
+    enabled:
+      - key: "controlPlane"
+        is: "true"
+  - name: "DB_MAX_CONN_IDLE_TIME"
+    value: ""
+    required: false
+    enabled:
+      - key: "controlPlane"
+        is: "true"
+  # ClickHouse DSN the Observe feature persists telemetry through, e.g.
+  # clickhouse://user:password@host:9000/database. Requires controlPlane="true";
+  # unset leaves Observe (identity included) disabled.
+  - name: "CLICKHOUSE_URL"
+    value: ""
+    enabled: true
+    required: false
+  # Path to a GeoLite2 .mmdb file inside the container, used to locate devices
+  # in the Identity dashboard. Unset leaves devices unlocated.
+  - name: "GEOIP_MMDB_PATH"
+    value: ""
+    enabled: true
+    required: false
   # Set to "true" to record nothing about the devices being served: no device
   # registry, no update-health state, no telemetry ingestion. Updates are
   # delivered exactly the same; the Observe and Identity dashboards report the

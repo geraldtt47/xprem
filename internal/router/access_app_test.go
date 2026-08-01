@@ -7,8 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"expo-open-ota/ee/apikeyrestrictions"
-	"expo-open-ota/internal/services"
+	"xprem/ee/apikeyrestrictions"
+	"xprem/internal/services"
 
 	"github.com/gorilla/mux"
 )

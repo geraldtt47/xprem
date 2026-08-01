@@ -6,9 +6,9 @@ package rbac
 
 import (
 	"context"
-	"expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/services"
 	"log"
+	"xprem/internal/mcptools"
+	"xprem/internal/services"
 )
 
 // The MCP-facing decision functions: each one matches a mcptools.Deps field,

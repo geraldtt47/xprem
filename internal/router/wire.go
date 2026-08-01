@@ -2,33 +2,33 @@ package infrastructure
 
 import (
 	"context"
-	"expo-open-ota/config"
-	"expo-open-ota/ee/apikeyrestrictions"
-	"expo-open-ota/ee/audit"
-	"expo-open-ota/ee/branchprotection"
-	"expo-open-ota/ee/geoip"
-	"expo-open-ota/ee/identity"
-	"expo-open-ota/ee/licensing"
-	eemcptools "expo-open-ota/ee/mcptools"
-	"expo-open-ota/ee/observe"
-	"expo-open-ota/ee/rbac"
-	"expo-open-ota/ee/sso"
-	"expo-open-ota/internal/bucket"
-	"expo-open-ota/internal/cache"
-	"expo-open-ota/internal/database"
-	"expo-open-ota/internal/database/clickhouse"
-	"expo-open-ota/internal/database/postgres"
-	"expo-open-ota/internal/database/postgres/migrations"
-	"expo-open-ota/internal/handlers"
-	dashhandlers "expo-open-ota/internal/handlers/dashboard"
-	"expo-open-ota/internal/mcp"
-	"expo-open-ota/internal/mcptools"
-	"expo-open-ota/internal/oauth"
-	"expo-open-ota/internal/ratelimit"
-	"expo-open-ota/internal/services"
-	"expo-open-ota/internal/store"
 	"log"
 	"time"
+	"xprem/config"
+	"xprem/ee/apikeyrestrictions"
+	"xprem/ee/audit"
+	"xprem/ee/branchprotection"
+	"xprem/ee/geoip"
+	"xprem/ee/identity"
+	"xprem/ee/licensing"
+	eemcptools "xprem/ee/mcptools"
+	"xprem/ee/observe"
+	"xprem/ee/rbac"
+	"xprem/ee/sso"
+	"xprem/internal/bucket"
+	"xprem/internal/cache"
+	"xprem/internal/database"
+	"xprem/internal/database/clickhouse"
+	"xprem/internal/database/postgres"
+	"xprem/internal/database/postgres/migrations"
+	"xprem/internal/handlers"
+	dashhandlers "xprem/internal/handlers/dashboard"
+	"xprem/internal/mcp"
+	"xprem/internal/mcptools"
+	"xprem/internal/oauth"
+	"xprem/internal/ratelimit"
+	"xprem/internal/services"
+	"xprem/internal/store"
 )
 
 type AppContainer struct {
@@ -185,7 +185,7 @@ func InitDependencies(ctx context.Context) (*AppContainer, func()) {
 	} else {
 		log.Println("⚙️  [STATELESS] Initializing Stateless Mode (Flat-Env Mode)...")
 		if err := config.LoadAppsFromFlatEnv(); err != nil {
-			log.Fatalf("Invalid apps config: %v\nSee https://mercure-technologies.gitbook.io/expo-open-ota/stateless-mode/getting-started for the stateless (flat-env) config format.", err)
+			log.Fatalf("Invalid apps config: %v\nSee https://mercure-technologies.gitbook.io/xprem/stateless-mode/getting-started for the stateless (flat-env) config format.", err)
 		}
 		authRepo = store.NewBucketAuthStore(resolvedBucket)
 		appRepo = store.NewBucketAppStore(resolvedBucket)

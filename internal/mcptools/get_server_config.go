@@ -3,10 +3,10 @@ package mcptools
 import (
 	"context"
 	"errors"
-	"expo-open-ota/config"
-	"expo-open-ota/internal/cdn"
-	"expo-open-ota/internal/helpers"
-	"expo-open-ota/internal/version"
+	"xprem/config"
+	"xprem/internal/cdn"
+	"xprem/internal/helpers"
+	"xprem/internal/version"
 
 	mcpprot "github.com/modelcontextprotocol/go-sdk/mcp"
 )

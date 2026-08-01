@@ -21,7 +21,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"expo-open-ota/ee/geoip"
+	"xprem/ee/geoip"
 )
 
 // ErrTooManySchemaKeys is returned when declaring a new allowlist key would exceed MaxSchemaKeys.
