@@ -12,6 +12,7 @@ import (
 	"time"
 	"xprem/config"
 	"xprem/internal/assets"
+	cache2 "xprem/internal/cache"
 	cdn2 "xprem/internal/cdn"
 	"xprem/internal/crypto"
 	"xprem/internal/keyStore"
@@ -119,7 +120,7 @@ func (s *ExpoProtocolService) signDirectiveOrManifest(ctx context.Context, appId
 	if expectSignatureHeader == "" {
 		return "", nil
 	}
-	appConfig, err := s.appRepo.GetAppByID(ctx, appId)
+	appConfig, err := s.cachedAppConfig(ctx, appId)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch app config for app ID '%s': %w", appId, err)
 	}
@@ -128,10 +129,27 @@ func (s *ExpoProtocolService) signDirectiveOrManifest(ctx context.Context, appId
 	if err != nil {
 		return "", fmt.Errorf("error stringifying content: %w", err)
 	}
+	// The key fingerprint is part of the cache key so a key rotation misses
+	// the cache instead of serving a signature made with the old key.
+	keyFingerprint, err := crypto.CreateHash([]byte(privateKey), "sha256", "hex")
+	if err != nil {
+		return "", fmt.Errorf("error hashing signing key fingerprint: %w", err)
+	}
+	contentHash, err := crypto.CreateHash(contentJSON, "sha256", "hex")
+	if err != nil {
+		return "", fmt.Errorf("error hashing signed content: %w", err)
+	}
+	cacheKey := signatureCacheKey(appId, keyFingerprint, contentHash)
+	signatureCache := cache2.GetCache()
+	if signedHash := signatureCache.Get(cacheKey); signedHash != "" {
+		return signedHash, nil
+	}
 	signedHash, err := crypto.SignRSASHA256(string(contentJSON), privateKey)
 	if err != nil {
 		return "", fmt.Errorf("error signing content hash: %w", err)
 	}
+	ttl := signatureCacheTTLSeconds
+	_ = signatureCache.Set(cacheKey, signedHash, &ttl)
 	return signedHash, nil
 }
 
@@ -243,12 +261,12 @@ func (s *ExpoProtocolService) ResolveManifestBundle(ctx context.Context, params 
 	// returns an empty token for the unknown id and we end up POSTing to
 	// api.expo.dev with `Bearer ` (no token), surfacing the upstream 401
 	// as an opaque 500 to the client.
-	if _, err := s.appRepo.GetAppByID(ctx, params.AppID); err != nil {
+	if _, err := s.cachedAppConfig(ctx, params.AppID); err != nil {
 		log.Printf("[RequestID: %s] Unknown app id %q", params.RequestID, params.AppID)
 		return ManifestResult{}, &ExpoProtocolError{StatusCode: http.StatusNotFound, Message: "Unknown app id"}
 	}
 
-	branchMap, err := s.channelRepo.GetChannelBranchMapping(ctx, params.AppID, params.ChannelName)
+	branchMap, err := s.channelBranchMapping(ctx, params.AppID, params.ChannelName)
 	if err != nil {
 		log.Printf("[RequestID: %s] Error fetching channel mapping: %v", params.RequestID, err)
 		return ManifestResult{}, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: fmt.Sprintf("Error fetching channel mapping: %v", err)}
@@ -281,7 +299,7 @@ func (s *ExpoProtocolService) ResolveManifestBundle(ctx context.Context, params 
 			BranchName: servedBranch,
 		}, nil
 	}
-	updateType, err := s.updateRepo.GetUpdateType(ctx, *lastUpdate)
+	updateType, err := s.cachedUpdateType(ctx, *lastUpdate)
 	if err != nil {
 		log.Printf("[RequestID: %s] Error determining update type: %v", params.RequestID, err)
 		return ManifestResult{}, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: "Error determining update type"}
@@ -328,12 +346,12 @@ func (s *ExpoProtocolService) ResolveAssetBundle(ctx context.Context, params Ass
 	// [Stateless mode] Same edge check as ManifestHandler, reject unknown ids with 404
 	// rather than letting them flow into FetchExpoChannelMapping and
 	// surfacing the upstream 401 as a 500.
-	if _, err := s.appRepo.GetAppByID(ctx, params.AppID); err != nil {
+	if _, err := s.cachedAppConfig(ctx, params.AppID); err != nil {
 		log.Printf("[RequestID: %s] Unknown app id %q", params.RequestID, params.AppID)
 		return &ExpoAssetResult{}, &ExpoProtocolError{StatusCode: http.StatusNotFound, Message: "Unknown app id"}
 	}
 
-	branchMap, err := s.channelRepo.GetChannelBranchMapping(ctx, params.AppID, params.ChannelName)
+	branchMap, err := s.channelBranchMapping(ctx, params.AppID, params.ChannelName)
 	if err != nil {
 		log.Printf("[RequestID: %s] Error fetching channel mapping: %v", params.RequestID, err)
 		return &ExpoAssetResult{}, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: fmt.Sprintf("Error fetching channel mapping: %v", err)}
