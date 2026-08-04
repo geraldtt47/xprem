@@ -2,8 +2,10 @@ package services
 
 import (
 	"context"
+	"xprem/internal/branch"
 	"xprem/internal/providers/expo"
 	"xprem/internal/rollout"
+	"xprem/internal/types"
 )
 
 // BranchResolutionRequest carries everything a rule needs to decide which branches a
@@ -16,6 +18,10 @@ type BranchResolutionRequest struct {
 	Platform       string
 	RuntimeVersion string
 	Mapping        *expo.ChannelMapping
+	// RequestedBranch is the xprem-branch header, empty when the device asks for
+	// nothing in particular. Surfing is the channel's setting for it.
+	RequestedBranch string
+	Surfing         types.BranchSurfing
 }
 
 // BranchRule is one step of the ordered channel-resolution chain evaluated at
@@ -28,10 +34,11 @@ type BranchRule interface {
 	Evaluate(ctx context.Context, req *BranchResolutionRequest) (candidates []string, matched bool, err error)
 }
 
-// DefaultBranchRules is the MIT rule chain: the channel-rollout percentage split when
-// one is active, then the plain mapped branch.
+// DefaultBranchRules is the MIT rule chain: the branch the device asked for when the
+// channel allows it, then the channel-rollout percentage split when one is active,
+// then the plain mapped branch.
 func DefaultBranchRules() []BranchRule {
-	return []BranchRule{&channelRolloutPercentRule{}, &defaultBranchRule{}}
+	return []BranchRule{&branchSurfRule{}, &channelRolloutPercentRule{}, &defaultBranchRule{}}
 }
 
 // ResolveBranchCandidates evaluates the rules in order and returns the first match's
@@ -48,6 +55,30 @@ func ResolveBranchCandidates(ctx context.Context, rules []BranchRule, req *Branc
 		}
 	}
 	return []string{req.Mapping.BranchName}, nil
+}
+
+// branchSurfRule serves the branch the device asked for. Ahead of the rollout rule: a
+// surf is an explicit choice and does not go back through the bucket draw. Asking for
+// the mapped branch is not a surf, so it falls through and keeps the rollout.
+type branchSurfRule struct{}
+
+// HonoursSurf reports whether the chain will serve the branch the device asked for.
+// Anything downstream that needs to know "is this poll actually surfing" must ask
+// here rather than re-test the header, or it treats declined requests as surfs.
+func HonoursSurf(req *BranchResolutionRequest) bool {
+	return req.RequestedBranch != "" &&
+		req.Surfing.Enabled &&
+		req.RequestedBranch != req.Mapping.BranchName &&
+		branch.MatchPattern(req.Surfing.Pattern, req.RequestedBranch)
+}
+
+func (r *branchSurfRule) Evaluate(ctx context.Context, req *BranchResolutionRequest) ([]string, bool, error) {
+	if !HonoursSurf(req) {
+		return nil, false, nil
+	}
+	// The mapped branch stays a candidate: a surfed branch with no update for the
+	// device's runtime version falls back instead of stranding it.
+	return []string{req.RequestedBranch, req.Mapping.BranchName}, true, nil
 }
 
 // channelRolloutPercentRule implements the channel rollout split: devices bucketed

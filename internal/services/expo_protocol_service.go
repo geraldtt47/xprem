@@ -12,6 +12,7 @@ import (
 	"time"
 	"xprem/config"
 	"xprem/internal/assets"
+	"xprem/internal/branch"
 	cache2 "xprem/internal/cache"
 	cdn2 "xprem/internal/cdn"
 	"xprem/internal/crypto"
@@ -41,12 +42,20 @@ type ManifestRequestParams struct {
 	CurrentUpdateID       string
 	ExpoFatalError        string
 	RecentFailedUpdateIDs string
+	XpremBranch           string
+	// SurfBlockTokens is the xprem-surf-blocked header verbatim: the comma
+	// separated "<branch>@<updateId>" verdicts the device echoes back, having
+	// persisted them from a previous expo-server-defined-headers response.
+	SurfBlockTokens string
 }
 
 type ManifestResult struct {
 	Update     *types.Update
 	BranchName string
 	UpdateType types.UpdateType
+	// BlockedSurf is set when the branch the device asked for was refused; the
+	// response carries the verdict so the device stops asking for it.
+	BlockedSurf *BlockedSurf
 }
 
 type ExpoProtocolError struct {
@@ -168,7 +177,7 @@ func writeResponse(w http.ResponseWriter, writer *multipart.Writer, buf *bytes.B
 	}
 }
 
-func (s *ExpoProtocolService) PutUpdateInResponse(w http.ResponseWriter, r *http.Request, appId string, lastUpdate types.Update, platform string, protocolVersion int64, requestID string) {
+func (s *ExpoProtocolService) PutUpdateInResponse(w http.ResponseWriter, r *http.Request, appId string, lastUpdate types.Update, platform string, protocolVersion int64, requestID string, refusedBranch string) {
 	currentUpdateId := r.Header.Get("expo-current-update-id")
 	metadata, err := update2.GetMetadata(lastUpdate)
 	if err != nil {
@@ -187,6 +196,10 @@ func (s *ExpoProtocolService) PutUpdateInResponse(w http.ResponseWriter, r *http
 		http.Error(w, "Error composing manifest", http.StatusInternalServerError)
 		return
 	}
+	// Stamped on the copy about to be served, never on the cached manifest: the
+	// cache is keyed by branch, and this is per request. Signing happens
+	// downstream, so it covers the stamp.
+	manifest.Extra.BranchSurfingRefused = refusedBranch
 	if currentUpdateId != "" {
 		metrics.TrackUpdateDownload(appId, platform, lastUpdate.RuntimeVersion, lastUpdate.Branch, manifest.Id, "update")
 	}
@@ -276,7 +289,7 @@ func (s *ExpoProtocolService) ResolveManifestBundle(ctx context.Context, params 
 		return ManifestResult{}, &ExpoProtocolError{StatusCode: http.StatusNotFound, Message: "No branch mapping found"}
 	}
 
-	servedBranch, lastUpdate, err := s.resolveUpdateForDevice(ctx, params.RequestID, params.AppID, params.ChannelName, params.ClientID, params.Platform, params.RuntimeVersion, branchMap)
+	servedBranch, lastUpdate, blockedSurfResult, err := s.resolveUpdateForDevice(ctx, params.RequestID, params.AppID, params.ChannelName, params.ClientID, params.Platform, params.RuntimeVersion, params.XpremBranch, params.SurfBlockTokens, params.RecentFailedUpdateIDs, branchMap)
 	if err != nil {
 		return ManifestResult{}, err
 	}
@@ -295,8 +308,9 @@ func (s *ExpoProtocolService) ResolveManifestBundle(ctx context.Context, params 
 
 	if lastUpdate == nil {
 		return ManifestResult{
-			Update:     nil,
-			BranchName: servedBranch,
+			Update:      nil,
+			BranchName:  servedBranch,
+			BlockedSurf: blockedSurfResult,
 		}, nil
 	}
 	updateType, err := s.cachedUpdateType(ctx, *lastUpdate)
@@ -305,7 +319,7 @@ func (s *ExpoProtocolService) ResolveManifestBundle(ctx context.Context, params 
 		return ManifestResult{}, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: "Error determining update type"}
 	}
 
-	return ManifestResult{Update: lastUpdate, BranchName: servedBranch, UpdateType: updateType}, nil
+	return ManifestResult{Update: lastUpdate, BranchName: servedBranch, UpdateType: updateType, BlockedSurf: blockedSurfResult}, nil
 }
 
 // resolveUpdateForDevice runs the branch rule chain, then serves the first candidate
@@ -314,32 +328,54 @@ func (s *ExpoProtocolService) ResolveManifestBundle(ctx context.Context, params 
 // nil (out-of-bucket with no control => noUpdateAvailable, deliberately no fallback to
 // the next candidate). Shared by manifest and asset resolution so the two paths take
 // the same rollout decision for a device.
-func (s *ExpoProtocolService) resolveUpdateForDevice(ctx context.Context, requestID string, appId string, channelName string, clientID string, platform string, runtimeVersion string, branchMap *expo.ChannelMapping) (string, *types.Update, error) {
+func (s *ExpoProtocolService) resolveUpdateForDevice(ctx context.Context, requestID string, appId string, channelName string, clientID string, platform string, runtimeVersion string, requestedBranch string, surfBlockTokens string, failedUpdateIDsRaw string, branchMap *expo.ChannelMapping) (servedBranchName string, lastUpdate *types.Update, blocked *BlockedSurf, err error) {
 	req := &BranchResolutionRequest{
-		AppID:          appId,
-		ChannelName:    channelName,
-		ClientID:       clientID,
-		Platform:       platform,
-		RuntimeVersion: runtimeVersion,
-		Mapping:        branchMap,
+		AppID:           appId,
+		ChannelName:     channelName,
+		ClientID:        clientID,
+		Platform:        platform,
+		RuntimeVersion:  runtimeVersion,
+		Mapping:         branchMap,
+		RequestedBranch: requestedBranch,
+	}
+	if requestedBranch != "" {
+		enabled, pattern := s.branchSurfingEnabled(ctx, appId, channelName)
+		req.Surfing = types.BranchSurfing{Enabled: enabled, Pattern: pattern}
 	}
 	candidates, err := ResolveBranchCandidates(ctx, s.branchRules, req)
 	if err != nil {
 		log.Printf("[RequestID: %s] Error resolving branch candidates: %v", requestID, err)
-		return "", nil, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: "Error resolving branch"}
+		return "", nil, nil, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: "Error resolving branch"}
 	}
+	// Gated on the rule having honoured the surf, not on the header being present:
+	// a declined request is a plain poll, and refusing one would take a device off
+	// the branch its own channel maps to. It also keeps the lookups below off the
+	// steady-state path, and off every deployment where surfing is disabled.
+	surfing := HonoursSurf(req)
+	var blocks surfBlockSet
+	if surfing && (surfBlockTokens != "" || failedUpdateIDsRaw != "") {
+		blocks = s.collectSurfBlocks(ctx, appId, surfBlockTokens, failedUpdateIDsRaw)
+	}
+
 	servedBranch := branchMap.BranchName
 	for _, candidate := range candidates {
 		resolution, err := s.updateService.GetLatestUpdateForClient(ctx, appId, candidate, runtimeVersion, platform, clientID)
 		if err != nil {
 			log.Printf("[RequestID: %s] Error getting latest update: %v", requestID, err)
-			return "", nil, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: "Error getting latest update"}
+			return "", nil, nil, &ExpoProtocolError{StatusCode: http.StatusInternalServerError, Message: "Error getting latest update"}
 		}
-		if resolution.BranchHasUpdate {
-			return candidate, resolution.Update, nil
+		if !resolution.BranchHasUpdate {
+			continue
 		}
+		if surfing && candidate == requestedBranch && resolution.Update != nil &&
+			blocks.contains(candidate, resolution.Update.UpdateId) {
+			log.Printf("[RequestID: %s] Refusing surf to %q: update %s failed to launch on this device", requestID, candidate, resolution.Update.UpdateId)
+			blocked = &BlockedSurf{BranchName: candidate, Token: surfBlockToken(candidate, resolution.Update.UpdateId)}
+			continue
+		}
+		return candidate, resolution.Update, blocked, nil
 	}
-	return servedBranch, nil, nil
+	return servedBranch, nil, blocked, nil
 }
 
 func (s *ExpoProtocolService) ResolveAssetBundle(ctx context.Context, params AssetResolutionParams) (*ExpoAssetResult, error) {
@@ -431,7 +467,7 @@ func (s *ExpoProtocolService) ResolveAssetBundle(ctx context.Context, params Ass
 // latest-update behavior.
 func (s *ExpoProtocolService) resolveAssetUpdate(ctx context.Context, params AssetResolutionParams, branchMap *expo.ChannelMapping) (string, *types.Update, error) {
 	if config.IsDBMode() {
-		if params.UpdateID != "" && params.Branch != "" && s.isAssetBranchAllowed(params.Branch, branchMap) {
+		if params.UpdateID != "" && params.Branch != "" && s.isAssetBranchAllowed(ctx, params.AppID, params.ChannelName, params.Branch, branchMap) {
 			pinnedUpdate, err := s.updateRepo.GetUpdate(ctx, params.AppID, params.Branch, params.RuntimeVersion, params.UpdateID)
 			if err != nil {
 				log.Printf("[RequestID: %s] Ignoring invalid updateId param %q: %v", params.RequestID, params.UpdateID, err)
@@ -451,23 +487,29 @@ func (s *ExpoProtocolService) resolveAssetUpdate(ctx context.Context, params Ass
 			if err != nil {
 				log.Printf("[RequestID: %s] Ignoring invalid Expo-Requested-Update-ID %q: %v", params.RequestID, params.RequestedUpdateID, err)
 			} else if requestedUpdate != nil {
-				if s.isAssetBranchAllowed(requestedUpdate.Branch, branchMap) {
+				if s.isAssetBranchAllowed(ctx, params.AppID, params.ChannelName, requestedUpdate.Branch, branchMap) {
 					return requestedUpdate.Branch, requestedUpdate, nil
 				}
 				log.Printf("[RequestID: %s] Ignoring Expo-Requested-Update-ID %q: branch %q is not served by channel %q", params.RequestID, params.RequestedUpdateID, requestedUpdate.Branch, params.ChannelName)
 			}
 		}
 	}
-	return s.resolveUpdateForDevice(ctx, params.RequestID, params.AppID, params.ChannelName, params.ClientID, params.Platform, params.RuntimeVersion, branchMap)
+	branchName, lastUpdate, _, err := s.resolveUpdateForDevice(ctx, params.RequestID, params.AppID, params.ChannelName, params.ClientID, params.Platform, params.RuntimeVersion, params.Branch, "", "", branchMap)
+	return branchName, lastUpdate, err
 }
 
-// isAssetBranchAllowed restricts the branch query param to the branches the channel
-// can legitimately serve: its mapped branch and, during a channel rollout, the rollout
-// branch. Anything else falls through to the later tiers instead of letting a crafted
-// URL read another branch's files.
-func (s *ExpoProtocolService) isAssetBranchAllowed(branch string, branchMap *expo.ChannelMapping) bool {
-	if branch == branchMap.BranchName {
+// isAssetBranchAllowed answers the mirror of the manifest question: could manifest
+// resolution for this channel have served this branch? It must stay exactly as
+// permissive as that resolution. Wider and the branch query param becomes a
+// cross-branch read primitive; narrower and the assets of a legitimately surfed
+// branch 404.
+func (s *ExpoProtocolService) isAssetBranchAllowed(ctx context.Context, appId string, channelName string, branchName string, branchMap *expo.ChannelMapping) bool {
+	if branchName == branchMap.BranchName {
 		return true
 	}
-	return branchMap.Rollout != nil && branch == branchMap.Rollout.BranchName
+	if branchMap.Rollout != nil && branchName == branchMap.Rollout.BranchName {
+		return true
+	}
+	enabled, pattern := s.branchSurfingEnabled(ctx, appId, channelName)
+	return enabled && branch.MatchPattern(pattern, branchName)
 }

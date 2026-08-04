@@ -138,8 +138,9 @@ type ManifestAsset struct {
 }
 
 type ExtraManifestData struct {
-	ExpoClient json.RawMessage `json:"expoClient"`
-	Branch     string          `json:"branch"`
+	ExpoClient           json.RawMessage `json:"expoClient"`
+	Branch               string          `json:"branch"`
+	BranchSurfingRefused string          `json:"branchSurfingRefused,omitempty"`
 }
 
 type UpdateManifest struct {
@@ -224,6 +225,32 @@ type ChannelMapping struct {
 	RolloutBranchCurrentUpdate *BranchUpdateState `json:"rolloutBranchCurrentUpdate,omitempty"`
 	// Active channel rollout, if any (control-plane mode only); nil otherwise.
 	Rollout *ChannelRollout `json:"rollout,omitempty"`
+	// Branch-surfing setting of the channel; nil in stateless mode, where the
+	// setting does not exist.
+	BranchSurfing *BranchSurfing `json:"branchSurfing,omitempty"`
+}
+
+// BranchSurfing is a channel's branch-surfing setting: whether a device polling
+// the channel may ask to be served a branch other than the mapped one, and
+// which branches it may reach. Pattern uses the "*" wildcard language of
+// branch.MatchPattern.
+type BranchSurfing struct {
+	Enabled bool   `json:"enabled"`
+	Pattern string `json:"pattern"`
+}
+
+// SurfableBranch is one entry of the branch list a device may surf to.
+// SurfableBranchList is the answer to a device's branch list request. Total
+// counts every branch that matched, so a client showing a truncated page can say
+// so instead of pretending the list is complete.
+type SurfableBranchList struct {
+	Branches []SurfableBranch `json:"branches"`
+	Total    int              `json:"total"`
+}
+
+type SurfableBranch struct {
+	Name         string `json:"name"`
+	LastUpdateAt string `json:"lastUpdateAt"`
 }
 
 type BranchMapping struct {
