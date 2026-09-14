@@ -1,0 +1,100 @@
+# Production Dokploy compose for xprem (mercuretechnologies/xprem fork).
+# Point Dokploy compose path here — NOT at the upstream dev docker-compose.yml.
+# Phase 2 metrics: add PROMETHEUS_ENABLED=true on ota-server (see docs/monitoring/05-xprem-metrics.md).
+
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - xprem_postgres_prod_data:/var/lib/postgresql/data
+    networks:
+      - dokploy-network
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8-alpine
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - xprem_clickhouse_prod_data:/var/lib/clickhouse
+    networks:
+      - dokploy-network
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'wget --spider -q http://localhost:8123/ping || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  ota-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-development}
+    ports:
+      - '3000'
+    environment:
+      - DB_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      - CLICKHOUSE_URL=clickhouse://${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}@clickhouse:9000/${CLICKHOUSE_DB}
+      - BASE_URL=${BASE_URL}
+      - TRUST_PROXY_HEADERS=true
+      - TRUST_PROXY_DEPTH=1
+      - JWT_SECRET=${JWT_SECRET}
+      - DB_KEYS_MASTER_KEY_B64=${DB_KEYS_MASTER_KEY_B64}
+      - USE_DASHBOARD=true
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - CACHE_MODE=local
+      - STORAGE_MODE=s3
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}
+      - AWS_BASE_ENDPOINT=${MINIO_ENDPOINT}
+      - AWS_S3_FORCE_PATH_STYLE=true
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - CDN_BASE_URL=${CDN_BASE_URL:-}
+      - DISABLE_S3_DIRECT_CDN=${DISABLE_S3_DIRECT_CDN:-}
+      # Phase 2: uncomment or add via Dokploy Environment tab
+      # - PROMETHEUS_ENABLED=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - dokploy-network
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'bash', '-c', 'echo > /dev/tcp/127.0.0.1/3000']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  xprem_postgres_prod_data:
+  xprem_clickhouse_prod_data:
