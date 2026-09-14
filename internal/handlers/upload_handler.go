@@ -169,7 +169,7 @@ func (h *UploadHandler) RequestUploadLocalFileHandler(w http.ResponseWriter, r *
 	requestID := uuid.New().String()
 	appId := mux.Vars(r)["APP_ID"]
 
-	token := r.URL.Query().Get("token")
+	token := r.Header.Get(bucket.LocalUploadTokenHeader)
 	if token == "" {
 		log.Printf("[RequestID: %s] No token provided", requestID)
 		http.Error(w, "No token provided", http.StatusBadRequest)
@@ -213,6 +213,10 @@ func (h *UploadHandler) RequestUploadLocalFileHandler(w http.ResponseWriter, r *
 		}
 		if errors.Is(err, services.ErrTokenAppMismatch) {
 			http.Error(w, "Upload token does not match this app", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, services.ErrUploadHashMismatch) {
+			http.Error(w, "Uploaded file does not match its hash", http.StatusBadRequest)
 			return
 		}
 		if errors.Is(err, services.ErrUploadFailed) {
