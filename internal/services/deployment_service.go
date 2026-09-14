@@ -27,12 +27,13 @@ import (
 )
 
 var (
-	ErrInvalidUpdate     = errors.New("invalid update")
-	ErrNoChangesDetected = errors.New("no changes detected in the update from the previous one")
-	ErrInvalidBucketType = errors.New("the configured storage engine does not support local uploads")
-	ErrInvalidToken      = errors.New("the provided upload token is invalid or expired")
-	ErrTokenAppMismatch  = errors.New("upload token does not match the requested application context")
-	ErrUploadFailed      = errors.New("failed to write upload file stream to destination storage")
+	ErrInvalidUpdate      = errors.New("invalid update")
+	ErrNoChangesDetected  = errors.New("no changes detected in the update from the previous one")
+	ErrInvalidBucketType  = errors.New("the configured storage engine does not support local uploads")
+	ErrInvalidToken       = errors.New("the provided upload token is invalid or expired")
+	ErrTokenAppMismatch   = errors.New("upload token does not match the requested application context")
+	ErrUploadFailed       = errors.New("failed to write upload file stream to destination storage")
+	ErrUploadHashMismatch = errors.New("uploaded file does not match its hash")
 	// ErrActiveRolloutBlocksPublish refuses any publish, republish or rollback on a
 	// (branch, runtime version) that has an active per-update rollout.
 	ErrActiveRolloutBlocksPublish = errors.New("a progressive rollout is active on this branch and runtime version; finish or revert it from the dashboard first")
@@ -317,16 +318,13 @@ func (s *DeploymentService) RequestUploadLocalFile(ctx context.Context, params R
 		return ErrTokenAppMismatch
 	}
 
-	success, err := bucket.HandleUploadFile(params.FilePath, params.Body)
-	if err != nil {
+	if err := bucket.HandleUploadFile(params.AppID, params.FilePath, params.Body); err != nil {
 		log.Printf("[RequestID: %s] Error handling upload file: %v", params.RequestID, err)
-		return err
-	}
-	if !success {
-		log.Printf("[RequestID: %s] Error handling upload file", params.RequestID)
+		if errors.Is(err, bucket.ErrBlobHashMismatch) {
+			return ErrUploadHashMismatch
+		}
 		return ErrUploadFailed
 	}
-
 	return nil
 }
 
@@ -661,6 +659,10 @@ func (s *DeploymentService) republishUpdateInternal(ctx context.Context, previou
 	if metadata.Platform != platform {
 		return nil, &RepublishError{Status: http.StatusBadRequest, Message: "Update platform mismatch"}
 	}
+	mapping, err := s.updateRepo.GetUpdateAssetMapping(ctx, *existing)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the source update asset mapping: %w", err)
+	}
 
 	updateId := update2.GenerateUpdateTimestamp(platform)
 	_, err = s.bucket.CreateUpdateFrom(previousUpdate, update2.ConvertUpdateTimestampToString(updateId))
@@ -670,6 +672,13 @@ func (s *DeploymentService) republishUpdateInternal(ctx context.Context, previou
 	newUpdate, err := s.updateRepo.CreateUpdate(ctx, previousUpdate.AppId, updateId, previousUpdate.Branch, previousUpdate.RuntimeVersion, platform, commitHash, "", publishGroup)
 	if err != nil {
 		return nil, err
+	}
+	// Shared blobs are not copied with the update folder. Preserve their mapping
+	// before publishing the new update; legacy updates have no mapping to copy.
+	if mapping != nil {
+		if err := s.updateRepo.StoreUpdateAssetMapping(ctx, *newUpdate, mapping); err != nil {
+			return nil, fmt.Errorf("failed to store the republished update asset mapping: %w", err)
+		}
 	}
 	err = s.MarkUpdateAsChecked(ctx, *newUpdate, types.NormalUpdate)
 	if err != nil {
