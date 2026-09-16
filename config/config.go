@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -24,6 +25,22 @@ func GetPort() string {
 		port = "3000"
 	}
 	return port
+}
+
+// GetBindAddress returns the address the API server listens on
+// (BIND_TO_ADDRESS). The default 0.0.0.0 accepts traffic on every interface.
+// Set it to 127.0.0.1 to keep the server on the
+// loopback interface, for example behind a reverse proxy on the same host.
+func GetBindAddress() string {
+	bind_to_address := GetEnv("BIND_TO_ADDRESS")
+
+	bind_address := net.ParseIP(bind_to_address)
+
+	if bind_address == nil {
+		log.Fatalf("Invalid BIND_TO_ADDRESS set; must be a valid IP")
+	}
+
+	return bind_address.String()
 }
 
 func GetDBURL() string {
@@ -319,6 +336,9 @@ var DefaultEnvValues = map[string]string{
 	// Client-controlled CDN bypass: opt-in because every asset client can use
 	// the header once it is enabled.
 	"ENABLE_PREVENT_CDN_REDIRECTION_HEADER": "false",
+
+	// Default address to bind to
+	"BIND_TO_ADDRESS": "0.0.0.0",
 
 	// Database connection defaults
 	"DB_URL":                "",
