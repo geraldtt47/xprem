@@ -334,6 +334,19 @@ export default class Publish extends Command {
       uploadFilesSpinner.fail('No files to upload');
       process.exit(1);
     }
+    const platformsToUpload: typeof runtimeVersions = [];
+    const missingBundlePlatforms: string[] = [];
+    for (const runtime of runtimeVersions) {
+      if (files.some(file => file.platform === runtime.platform && file.isLaunchAsset)) {
+        platformsToUpload.push(runtime);
+      } else {
+        missingBundlePlatforms.push(runtime.platform);
+      }
+    }
+    if (!platformsToUpload.length) {
+      uploadFilesSpinner.fail('No platforms with a bundle to upload');
+      process.exit(1);
+    }
     let uploadUrls: {
       uploadRequests: RequestUploadUrlItem[];
       updateId: string;
@@ -350,7 +363,7 @@ export default class Publish extends Command {
     const unchangedPlatforms: string[] = [];
     try {
       const outcomes = await Promise.all(
-        runtimeVersions.map(async ({ runtimeVersion, platform }) => {
+        platformsToUpload.map(async ({ runtimeVersion, platform }) => {
           if (!runtimeVersion) {
             throw new Error('Runtime version is not resolved');
           }
@@ -385,6 +398,9 @@ export default class Publish extends Command {
       });
       if (!uploadUrls.length) {
         uploadFilesSpinner.warn('⚠️ No changes found in the update, nothing to deploy');
+        for (const skipped of missingBundlePlatforms) {
+          Log.withInfo(`⚠️ No bundle exported for ${skipped}, skipping.`);
+        }
         return;
       }
       // Every path and URL the server handed back is checked here, before a
@@ -474,6 +490,9 @@ export default class Publish extends Command {
       }
       for (const skipped of unchangedPlatforms) {
         Log.withInfo(`⚠️ There is no change in the update for ${skipped}, ignored...`);
+      }
+      for (const skipped of missingBundlePlatforms) {
+        Log.withInfo(`⚠️ No bundle exported for ${skipped}, skipping.`);
       }
     } catch (e) {
       uploadFilesSpinner.fail('❌ Failed to upload static files');
