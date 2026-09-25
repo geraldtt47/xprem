@@ -117,6 +117,11 @@ async function digestExportFile(exportRoot: string, relativePath: string): Promi
   return await digestFile(absolutePath);
 }
 
+// Normalize backslashes (written by `expo export` on Windows) to the forward slashes the server requires.
+function toServerPath(relativePath: string): string {
+  return relativePath.replace(/\\/g, '/');
+}
+
 export async function computeFilesRequests(
   projectDir: string,
   outputDir: string,
@@ -152,7 +157,7 @@ export async function computeFilesRequests(
     }
     const bundle = metadata.fileMetadata[platform].bundle;
     pending.push({
-      path: bundle,
+      path: toServerPath(bundle),
       name: path.basename(bundle),
       ext: 'hbc',
       platform,
@@ -160,7 +165,7 @@ export async function computeFilesRequests(
     });
     for (const asset of metadata.fileMetadata[platform].assets) {
       pending.push({
-        path: asset.path,
+        path: toServerPath(asset.path),
         name: path.basename(asset.path),
         ext: asset.ext,
         platform,
