@@ -62,6 +62,19 @@ services:
         VERSION: ${VERSION:-development}
     labels:
       traefik.http.routers.project-resources-xprem-ota-ely0ye-25-websecure.service: project-resources-xprem-ota-ely0ye-25-web
+      # Permanent redirect exact / → dashboard (see docs/dokploy-deployment.md)
+      traefik.http.middlewares.xprem-root-redirect.redirectregex.regex: ^https?://xprem\.webminglers\.co\.za/?$
+      traefik.http.middlewares.xprem-root-redirect.redirectregex.replacement: https://xprem.webminglers.co.za/dashboard/
+      traefik.http.middlewares.xprem-root-redirect.redirectregex.permanent: "true"
+      traefik.http.routers.xprem-root-web.rule: Host(`xprem.webminglers.co.za`) && Path(`/`)
+      traefik.http.routers.xprem-root-web.entrypoints: web
+      traefik.http.routers.xprem-root-web.middlewares: xprem-root-redirect
+      traefik.http.routers.xprem-root-web.priority: "1000"
+      traefik.http.routers.xprem-root-websecure.rule: Host(`xprem.webminglers.co.za`) && Path(`/`)
+      traefik.http.routers.xprem-root-websecure.entrypoints: websecure
+      traefik.http.routers.xprem-root-websecure.middlewares: xprem-root-redirect
+      traefik.http.routers.xprem-root-websecure.priority: "1000"
+      traefik.http.routers.xprem-root-websecure.tls: "true"
     environment:
       - DB_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       - CLICKHOUSE_URL=clickhouse://${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}@clickhouse:9000/${CLICKHOUSE_DB}
