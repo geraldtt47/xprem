@@ -11,8 +11,10 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { getPrivateExpoConfigAsync } from '../../lib/expoConfig';
 import { fetchWithRetries } from '../../lib/fetch';
 import Log from '../../lib/log';
+import { resolveRuntimeVersionAsync } from '../../lib/runtimeVersion';
 import Publish from '../publish';
 
 vi.mock('@expo/spawn-async', () => ({ default: vi.fn() }));
@@ -41,7 +43,7 @@ vi.mock('../../lib/vcs', () => ({
 }));
 vi.mock('../../lib/package', () => ({ isExpoInstalled: () => true }));
 vi.mock('../../lib/runtimeVersion', () => ({
-  resolveRuntimeVersionAsync: async () => ({ runtimeVersion: '1.0.0' }),
+  resolveRuntimeVersionAsync: vi.fn(async () => ({ runtimeVersion: '1.0.0' })),
 }));
 vi.mock('../../lib/workflow', async importOriginal => ({
   ...(await importOriginal<typeof import('../../lib/workflow')>()),
@@ -51,7 +53,7 @@ vi.mock('../../lib/expoConfig', async importOriginal => {
   const original = await importOriginal<typeof import('../../lib/expoConfig')>();
   return {
     ...original,
-    getPrivateExpoConfigAsync: async () => ({}),
+    getPrivateExpoConfigAsync: vi.fn(async () => ({ name: 'test-app', slug: 'test-app' })),
     getPublicExpoConfigAsync: async () => ({ name: 'test-app' }),
     requireExpoAppId: () => 'app-1',
     resolveServerUrl: async () => 'https://ota.example.com',
@@ -71,14 +73,19 @@ function distFile(...segments: string[]): string {
 
 // The export the CLI believes it produced. spawnAsync is mocked, so this mock
 // writes what `expo export` would have written.
-function writeExport(): void {
+function writeExport(platforms: ('ios' | 'android')[] = ['ios']): void {
   fs.ensureDirSync(distFile('bundles'));
+  const fileMetadata: Record<string, { bundle: string; assets: unknown[] }> = {};
+  for (const platform of platforms) {
+    const bundle = `bundles/${platform}-abc.hbc`;
+    fileMetadata[platform] = { bundle, assets: [] };
+    fs.writeFileSync(distFile('bundles', `${platform}-abc.hbc`), 'BUNDLE BYTES');
+  }
   fs.writeJsonSync(distFile('metadata.json'), {
     version: 0,
     bundler: 'metro',
-    fileMetadata: { ios: { bundle: 'bundles/ios-abc.hbc', assets: [] } },
+    fileMetadata,
   });
-  fs.writeFileSync(distFile('bundles', 'ios-abc.hbc'), 'BUNDLE BYTES');
 }
 
 function uploadRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -124,14 +131,36 @@ function loggedErrors(): string {
     .join('\n');
 }
 
-function runPublish(): Promise<unknown> {
+function loggedInfos(): string {
+  return vi
+    .mocked(Log.withInfo)
+    .mock.calls.flat()
+    .map(arg => String(arg))
+    .join('\n');
+}
+
+function requestUploadUrlCalls(): string[] {
+  return vi
+    .mocked(fetchWithRetries)
+    .mock.calls.map(([url]) => String(url))
+    .filter(url => url.includes('/requestUploadUrl/'));
+}
+
+function runPublish(platform: string | null = 'ios'): Promise<unknown> {
   return Publish.run(
-    ['--branch', 'main', '--platform', 'ios', '--nonInteractive', '--disableRepositoryCheck'],
+    [
+      '--branch',
+      'main',
+      ...(platform === null ? [] : ['--platform', platform]),
+      '--nonInteractive',
+      '--disableRepositoryCheck',
+    ],
     eoasRoot
   );
 }
 
 beforeEach(() => {
+  vi.mocked(getPrivateExpoConfigAsync).mockResolvedValue({ name: 'test-app', slug: 'test-app' });
   previousCwd = process.cwd();
   projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eoas-project-'));
   secretDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eoas-secrets-'));
@@ -145,6 +174,7 @@ beforeEach(() => {
     throw new Error(`process.exit(${code})`);
   }) as any);
   vi.spyOn(Log, 'error').mockImplementation(() => {});
+  vi.spyOn(Log, 'withInfo').mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -153,6 +183,95 @@ afterEach(() => {
   fs.removeSync(secretDir);
   vi.restoreAllMocks();
   vi.clearAllMocks();
+});
+
+describe('publish native platform selection', () => {
+  it.each(['ios', 'android'] as const)(
+    'publishes only the configured %s platform by default, without exporting web',
+    async configuredPlatform => {
+      vi.mocked(getPrivateExpoConfigAsync).mockResolvedValue({
+        name: 'test-app',
+        slug: 'test-app',
+        platforms: [configuredPlatform, 'web'],
+      });
+      vi.mocked(spawnAsync).mockImplementation((async (_command, args) => {
+        const selected = (args as string[]).flatMap((arg, index) =>
+          arg === '--platform' ? [(args as string[])[index + 1]] : []
+        );
+        // Like Expo, reject attempts to export a platform absent from the project.
+        if (selected.some(candidate => candidate !== configuredPlatform)) {
+          throw new Error('Unsupported native platform');
+        }
+        writeExport([configuredPlatform]);
+        return { stdout: 'exported', stderr: '' };
+      }) as any);
+      respondWith([]);
+
+      await runPublish(null);
+
+      expect(
+        vi.mocked(resolveRuntimeVersionAsync).mock.calls.map(([options]) => options.platform)
+      ).toEqual([configuredPlatform]);
+      const requested = requestUploadUrlCalls();
+      expect(requested).toHaveLength(1);
+      expect(new URL(requested[0]).searchParams.get('platform')).toBe(configuredPlatform);
+    }
+  );
+
+  it.each([{ platforms: undefined }, { platforms: ['ios', 'android', 'web'] as const }])(
+    'exports both native platforms when both are available, but never web (%j)',
+    async ({ platforms }) => {
+      vi.mocked(getPrivateExpoConfigAsync).mockResolvedValue({
+        name: 'test-app',
+        slug: 'test-app',
+        ...(platforms ? { platforms: [...platforms] } : {}),
+      });
+      vi.mocked(spawnAsync).mockImplementation((async () => {
+        writeExport(['ios', 'android']);
+        return { stdout: 'exported', stderr: '' };
+      }) as any);
+      respondWith([]);
+
+      await runPublish('all');
+
+      const args = vi.mocked(spawnAsync).mock.calls[0][1] as string[];
+      expect(args.slice(-4)).toEqual(['--platform', 'ios', '--platform', 'android']);
+      expect(requestUploadUrlCalls()).toHaveLength(2);
+    }
+  );
+
+  it('preserves an explicit platform instead of silently substituting the configured platform', async () => {
+    vi.mocked(getPrivateExpoConfigAsync).mockResolvedValue({
+      name: 'test-app',
+      slug: 'test-app',
+      platforms: ['android'],
+    });
+    respondWith([]);
+
+    await runPublish('ios');
+
+    expect(vi.mocked(spawnAsync).mock.calls[0][1]?.slice(-2)).toEqual(['--platform', 'ios']);
+    expect(
+      vi.mocked(resolveRuntimeVersionAsync).mock.calls.map(([options]) => options.platform)
+    ).toEqual(['ios']);
+  });
+
+  it('rejects a web-only configuration before cleaning the output or resolving runtimes', async () => {
+    vi.mocked(getPrivateExpoConfigAsync).mockResolvedValue({
+      name: 'test-app',
+      slug: 'test-app',
+      platforms: ['web'],
+    });
+    fs.ensureDirSync(distFile());
+    fs.writeFileSync(distFile('existing-output'), 'keep');
+
+    await expect(runPublish('all')).rejects.toThrow(/process\.exit\(1\)/);
+
+    expect(loggedErrors()).toMatch(/No iOS or Android platform is enabled/);
+    expect(spawnAsync).not.toHaveBeenCalled();
+    expect(resolveRuntimeVersionAsync).not.toHaveBeenCalled();
+    expect(fs.readFileSync(distFile('existing-output'), 'utf8')).toBe('keep');
+  });
 });
 
 describe('publish against a hostile server response', () => {
@@ -326,5 +445,50 @@ describe('publish against an honest server response', () => {
     expect(marked).toHaveLength(1);
     // The numeric updateId reached the query string as a string.
     expect(new URL(marked[0]).searchParams.get('updateId')).toBe('1753800000000');
+  });
+
+  it('skips platforms with no exported bundle when --platform is all', async () => {
+    // Repro: app.json "platforms": ["android"] so expo export emits only android,
+    // while --platform all still resolves an ios runtime version.
+    vi.mocked(spawnAsync).mockImplementation((async () => {
+      writeExport(['android']);
+      return { stdout: 'exported', stderr: '' };
+    }) as any);
+    respondWith([
+      uploadRequest(),
+      uploadRequest({
+        requestUploadUrl: 'https://storage.example.com/upload/expoConfig.json',
+        fileName: 'expoConfig.json',
+        filePath: 'expoConfig.json',
+      }),
+      uploadRequest({
+        requestUploadUrl: 'https://storage.example.com/upload/android-abc.hbc',
+        fileName: 'android-abc.hbc',
+        filePath: 'bundles/android-abc.hbc',
+      }),
+    ]);
+
+    await runPublish('all');
+
+    // Both platforms are named on the export: with no --platform, expo export
+    // bundles web too.
+    const exportArgs = vi.mocked(spawnAsync).mock.calls.map(([, args]) => args as string[]);
+    const exportCall = exportArgs.find(args => args.includes('export'));
+    expect(exportCall).toEqual(
+      expect.arrayContaining(['--platform', 'ios', '--platform', 'android'])
+    );
+    expect(exportCall).not.toContain('web');
+
+    const uploadRequests = requestUploadUrlCalls();
+    expect(uploadRequests).toHaveLength(1);
+    expect(new URL(uploadRequests[0]).searchParams.get('platform')).toBe('android');
+    expect(loggedInfos()).toMatch(/No bundle exported for ios, skipping\./);
+
+    const marked = vi
+      .mocked(fetchWithRetries)
+      .mock.calls.map(([url]) => String(url))
+      .filter(url => url.includes('/markUpdateAsUploaded/'));
+    expect(marked).toHaveLength(1);
+    expect(new URL(marked[0]).searchParams.get('platform')).toBe('android');
   });
 });

@@ -8,8 +8,8 @@ import (
 	"time"
 	"xprem/internal/handlers"
 	"xprem/internal/ratelimit"
+	"xprem/internal/repository"
 	"xprem/internal/services"
-	"xprem/internal/store"
 
 	"github.com/gorilla/mux"
 )
@@ -44,7 +44,7 @@ type UserResponse struct {
 	LastConnectedAt string `json:"lastConnectedAt,omitempty"`
 }
 
-func userResponseFrom(user store.User) UserResponse {
+func userResponseFrom(user repository.User) UserResponse {
 	createdAt := ""
 	if !user.CreatedAt.IsZero() {
 		createdAt = user.CreatedAt.UTC().Format(time.RFC3339)
@@ -71,9 +71,11 @@ func renderUserServiceError(w http.ResponseWriter, err error) {
 		errors.Is(err, services.ErrCannotChangeOwnAdminFlag),
 		errors.Is(err, services.ErrCannotDeleteOwnAccount),
 		errors.Is(err, services.ErrCannotDisableOwnAccount),
+		errors.Is(err, services.ErrCannotResetOwnPassword),
 		errors.Is(err, services.ErrInvalidCurrentPassword):
 		handlers.RenderError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, services.ErrLastAdmin),
+		errors.Is(err, services.ErrPasswordResetDisabledBySSO),
 		errors.Is(err, services.ErrUserCreationDisabledBySSO):
 		handlers.RenderError(w, http.StatusConflict, err.Error())
 	default:
@@ -81,11 +83,11 @@ func renderUserServiceError(w http.ResponseWriter, err error) {
 			handlers.RenderError(w, http.StatusBadRequest, validationErr.Error())
 			return
 		}
-		if notFoundErr := (*store.ErrResourceNotFound)(nil); errors.As(err, &notFoundErr) {
+		if notFoundErr := (*repository.ErrResourceNotFound)(nil); errors.As(err, &notFoundErr) {
 			handlers.RenderError(w, http.StatusNotFound, notFoundErr.Error())
 			return
 		}
-		if alreadyExistsErr := (*store.ErrResourceAlreadyExists)(nil); errors.As(err, &alreadyExistsErr) {
+		if alreadyExistsErr := (*repository.ErrResourceAlreadyExists)(nil); errors.As(err, &alreadyExistsErr) {
 			handlers.RenderError(w, http.StatusConflict, alreadyExistsErr.Error())
 			return
 		}
@@ -106,7 +108,7 @@ func (h *UsersHandler) GetMeHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Only a missing row means the session is a leftover of a deleted
 		// account; an infrastructure failure must not read as a dead session.
-		if notFoundErr := (*store.ErrResourceNotFound)(nil); errors.As(err, &notFoundErr) {
+		if notFoundErr := (*repository.ErrResourceNotFound)(nil); errors.As(err, &notFoundErr) {
 			handlers.RenderError(w, http.StatusUnauthorized, "Invalid token")
 			return
 		}
@@ -172,6 +174,36 @@ func (h *UsersHandler) ChangeMyPasswordHandler(w http.ResponseWriter, r *http.Re
 	// opposite of what happened. 204 is the same success with no renewed
 	// session attached, which sends the client to the sign-in page.
 	log.Printf("password changed for user %s but the session could not be renewed: %v", principal.UserId, err)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *UsersHandler) ResetUserPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	principal := services.PrincipalFromContext(r.Context())
+	if principal == nil {
+		handlers.RenderError(w, http.StatusUnauthorized, "This route requires a dashboard session")
+		return
+	}
+	if !principal.IsAdmin {
+		handlers.RenderError(w, http.StatusForbidden, "Only admins can reset user passwords")
+		return
+	}
+	var requestBody struct {
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+		handlers.RenderError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if requestBody.NewPassword == "" {
+		handlers.RenderError(w, http.StatusBadRequest, "newPassword is required")
+		return
+	}
+	if err := h.userService.ResetPassword(r.Context(), principal.UserId, mux.Vars(r)["USER_ID"], requestBody.NewPassword); err != nil {
+		renderUserServiceError(w, err)
+		return
+	}
+	// No replacement session: the target must sign in with the new password,
+	// and the acting administrator keeps their existing session.
 	w.WriteHeader(http.StatusNoContent)
 }
 
